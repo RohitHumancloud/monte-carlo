@@ -1,734 +1,1993 @@
-# Investment Execution Flow Research Document
+# Investment Execution Flow - Research & Implementation Plan
+
+**Date**: January 6, 2026
+**Purpose**: Post-proposal investment execution with custodian integration
+**Status**: Research Complete - Ready for Implementation
+
+---
 
 ## Executive Summary
 
-This document outlines the research and implementation strategy for the **Amount Investment Flow** - the process of executing real asset purchases after a customer accepts a proposal from the Relationship Manager (RM).
-
-**Goal**: Demonstrate end-to-end investment execution for demo purposes, with the flexibility for clients to integrate their own custodian in production.
+After an RM's proposal is accepted by a customer, the system needs to execute the actual investment orders - purchasing the specified funds/assets from the selected model portfolio. This document outlines the complete order execution lifecycle, custodian integration options, reconciliation processes, and a recommended implementation approach for demo purposes.
 
 ---
 
-## 1. Investment Execution Terminology
+## Table of Contents
 
-### 1.1 Key Concepts
-
-| Term | Definition |
-|------|------------|
-| **Custodian** | A financial institution that holds customers' securities and assets for safekeeping, handles settlement, and maintains records of ownership. Examples: BNY Mellon, State Street, Northern Trust. |
-| **Execution** | The actual buying/selling of securities on the market at the best available price. |
-| **Settlement** | The process of transferring securities from seller to buyer and cash from buyer to seller. In the US, equity settlement is T+1 (trade date + 1 business day). |
-| **Reconciliation** | The process of verifying that internal records match external custodian/broker records. Ensures data integrity across positions, cash, and transactions. |
-| **Order Lifecycle** | PENDING → SUBMITTED → FILLED (Partially/Fully) → SETTLED |
-| **NBBO** | National Best Bid and Offer - the best available ask price when buying and the best available bid price when selling a security. |
-| **Fractional Shares** | The ability to buy a portion of a share (e.g., 0.5 shares of a $500 stock). |
-| **IBOR** | Investment Book of Record - the authoritative record of all investment positions and transactions. |
-| **OMS** | Order Management System - software platform that manages the lifecycle of trades from order creation through execution and settlement. |
-
-### 1.2 Order Status Lifecycle
-
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   PENDING   │ -> │  SUBMITTED  │ -> │   ACCEPTED  │ -> │   FILLED    │ -> │   SETTLED   │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-                                              │
-                                              v
-                                      ┌─────────────┐
-                                      │  REJECTED   │
-                                      └─────────────┘
-```
-
-**Status Definitions:**
-- **PENDING**: Order created but not yet sent to broker
-- **SUBMITTED**: Order sent to broker/exchange
-- **ACCEPTED**: Order acknowledged by broker
-- **PARTIALLY_FILLED**: Some quantity executed, remaining pending
-- **FILLED**: All quantity executed at market
-- **SETTLED**: Cash/securities exchanged (T+1 for US equities)
-- **REJECTED**: Order rejected by broker
-- **CANCELLED**: Order cancelled by user
-
-### 1.3 Trade Lifecycle Structure
-
-The trade lifecycle operates across three divisions:
-- **Front Office—Trade Execution**: Implements trades, buying or selling securities at the best available price
-- **Middle Office—Risk & Compliance**: Monitors all trades to ensure validity and regulatory compliance
-- **Back Office—Settlement & Clearing**: Handles validity checks, discrepancies, and ensures settlements are made on time
+1. [Understanding Key Concepts](#1-understanding-key-concepts)
+2. [Order Execution Lifecycle](#2-order-execution-lifecycle)
+3. [Custodian Services](#3-custodian-services)
+4. [Reconciliation Process](#4-reconciliation-process)
+5. [Available Sandbox/Demo APIs](#5-available-sandboxdemo-apis)
+6. [Recommended Solution for Demo](#6-recommended-solution-for-demo)
+7. [Implementation Architecture](#7-implementation-architecture)
+8. [Data Model Design](#8-data-model-design)
+9. [API Endpoints](#9-api-endpoints)
+10. [UI/UX Design](#10-uiux-design)
+11. [Sources](#11-sources)
 
 ---
 
-## 2. Third-Party Trading API Options
+## 1. Understanding Key Concepts
 
-### 2.1 Global Platforms Comparison Matrix
+### 1.1 Custodian Services
 
-| Provider | Type | Sandbox | Fractional | Markets | Best For | Cost |
-|----------|------|---------|------------|---------|----------|------|
-| **Alpaca** | Broker-Dealer | ✅ Free Paper Trading | ✅ Yes | US Stocks, ETFs, Crypto | Demo/Startup | Free |
-| **DriveWealth** | Licensed Broker | ✅ UAT Environment | ✅ Yes (Patented Fracker®) | US Equities, ETFs, MF | Production-grade | Enterprise |
-| **Interactive Brokers** | Full Broker | ✅ Paper Trading | ❌ No | Global 160+ Markets | Advanced Trading | Per-trade |
-| **WealthKernel** | Custodian API | ✅ Sandbox | ✅ Yes | UK/US Stocks, ETFs, MFs | UK Market | Enterprise |
-| **Upvest** | Investment API | ✅ (Contact for access) | ✅ Yes (from €1) | European Stocks, ETFs | Europe | Enterprise |
-| **Paper Invest** | Simulation Only | ✅ Free | ❌ No | Simulated | Pure Demo | Free |
+**Definition**: A custodian (typically a bank or specialized financial institution) is an entity that holds and safeguards financial assets on behalf of clients. They provide security, record-keeping, and transaction processing services.
 
-### 2.2 India-Specific Platforms
+**Key Functions**:
 
-| Provider | Type | Sandbox | Assets | Best For | Cost |
-|----------|------|---------|--------|----------|------|
-| **Fintech Primitives** | MF API Platform | ✅ Sandbox at s.finprim.com | Mutual Funds | MF Distribution | Pay-as-you-use |
-| **Kite Connect (Zerodha)** | Trading API | ✅ (Publisher account) | Stocks, F&O, MF | Indian Stocks | ₹2000/month |
-| **Groww API** | Trading API | ✅ Limited | Stocks, F&O, MTF | Algo Trading | ₹499/month |
-| **DhanHQ** | Trading API | ✅ Closed Sandbox | Stocks, ETFs, Derivatives | Developers | Free APIs |
-| **5paisa** | Trading API | ✅ (UAT) | Equity, Derivatives | Retail Traders | ₹1000/month |
-| **ICICI Breeze** | Trading API | ✅ UAT | NSE/BSE Stocks | ICICI Customers | Free |
-| **ProStocks Star** | Trading API | ✅ 24x7 UAT | NSE Equity, F&O, Currency | Testing | ₹1000/month |
-| **BSE StAR MF** | MF Platform | ✅ Sandbox | Mutual Funds (45+ AMCs) | Distributors | Via RTA |
-| **NSE NMF II** | MF Platform | ✅ Sandbox | Mutual Funds | Distributors | Via NSE |
+- **Asset Safekeeping**: Physical/electronic custody of securities
+- **Settlement Services**: Processing buy/sell transactions
+- **Record Keeping**: Maintaining accurate transaction records
+- **Reconciliation**: Matching internal records with external sources
+- **Reporting**: Providing statements and regulatory reports
+- **Corporate Actions**: Processing dividends, splits, mergers
+
+**Major Players**:
+
+- Bank of New York Mellon (BNY Mellon)
+- State Street Corporation
+- J.P. Morgan Chase
+- Citibank
+- Northern Trust
+
+### 1.2 Order Management System (OMS)
+
+**Definition**: Software platform designed to streamline the entire lifecycle of trade orders from entry to settlement.
+
+**Core Capabilities**:
+
+- Order creation and routing
+- Trade execution tracking
+- Compliance monitoring
+- Real-time position tracking
+- Multi-asset class support
+- Integration with EMS (Execution Management System)
+
+### 1.3 Reconciliation
+
+**Definition**: Process of comparing and matching transaction records between different systems to ensure data consistency and accuracy.
+
+**Types**:
+
+- **Trade Reconciliation**: Match executed trades with order records
+- **Position Reconciliation**: Verify holdings match custodian records
+- **Cash Reconciliation**: Match cash balances and movements
+- **NAV Reconciliation**: Verify Net Asset Value calculations
 
 ---
 
-## 3. Recommended Platform: Alpaca Markets (Demo)
+## 2. Order Execution Lifecycle
 
-### 3.1 Why Alpaca is Ideal for Demo
+The complete trade lifecycle consists of three main phases:
 
-1. **Free Paper Trading**: No cost sandbox with $100,000 virtual cash
-2. **Real Market Data**: Simulates real NBBO pricing
-3. **Java SDK Available**: `alpaca-java` library on Maven
-4. **Commission-Free**: No transaction fees
-5. **REST + WebSocket**: Real-time order updates
-6. **Fractional Shares**: Buy $100 worth of any stock
-7. **Quick Setup**: Account creation in minutes
-8. **US Securities**: Stocks, ETFs, Options, Crypto
-9. **Global Access**: Anyone globally can create a paper-only account
+### Phase 1: Front Office - Trade Execution
 
-### 3.2 Alpaca Paper Trading Features
+**Steps**:
 
-- Real-time simulation environment
-- Order fills based on actual NBBO
-- Supports Market, Limit, Stop, Stop-Limit orders
-- Pattern Day Trader rules simulated
-- Real-time position and balance updates
-- Up to three paper trading accounts per user
-- Different API keys from live account
+1. **Order Initiation**: RM/System creates order based on approved proposal
+2. **Pre-Trade Validation**:
+   - Compliance checks (suitability, limits)
+   - Availability of funds
+   - Trading restrictions
+3. **Order Routing**: Send order to broker/custodian
+4. **Execution**: Trade executed at market/limit price
+5. **Confirmation**: Receive execution confirmation with:
+   - Execution price
+   - Quantity filled
+   - Transaction ID
+   - Timestamp
 
-### 3.3 Alpaca API Endpoints
+### Phase 2: Middle Office - Validation & Risk
+
+**Steps**:
+
+1. **Trade Capture**: Record executed trade details
+2. **Affirmation**: Both parties agree on trade details
+3. **Enrichment**: Add missing data (commissions, fees)
+4. **Validation**: Check for errors/exceptions
+5. **Risk Analysis**: Update risk metrics
+6. **Compliance Check**: Ensure regulatory compliance
+
+### Phase 3: Back Office - Settlement & Clearing
+
+**Steps**:
+
+1. **Clearing**: Determine obligations (who owes what)
+2. **Settlement Instruction**: Send to custodian/clearing house
+3. **Settlement**:
+   - **T+1 (US)**: Trade date + 1 business day
+   - **T+2 (Europe)**: Trade date + 2 business days
+4. **Asset Transfer**: Securities delivered to buyer's account
+5. **Cash Transfer**: Payment transferred to seller
+6. **Confirmation**: Final settlement confirmation
+7. **Reconciliation**: Match all records
+
+**Timeline**:
 
 ```
-Base URL (Paper): https://paper-api.alpaca.markets
-Data URL: https://data.alpaca.markets
-
-Key Endpoints:
-- GET  /v2/account          - Get account info
-- GET  /v2/positions        - Get all positions
-- POST /v2/orders           - Place an order
-- GET  /v2/orders/{id}      - Get order status
-- GET  /v2/orders           - List all orders
-- DELETE /v2/orders/{id}    - Cancel order
+Day 0 (T):    Trade Execution
+Day 1 (T+1):  Trade Affirmation & Enrichment
+Day 2 (T+2):  Settlement (for most markets)
+Day 3 (T+3):  Reconciliation & Reporting
 ```
 
-### 3.4 Order Request Example
+---
 
-```json
-POST /v2/orders
+## 3. Custodian Services
+
+### 3.1 Mutual Fund Custodians
+
+Specialized custodians for mutual fund assets that:
+
+- Secure securities in which mutual funds invest
+- Manage settlements for fund transactions
+- Track investor transactions
+- Ensure proper fund deposits/distributions
+- Maintain records for regulatory compliance
+
+**Reference**: [PL Capital - What is Mutual Fund Custodian](https://www.plindia.com/blogs/what-is-mutual-fund-custodian/)
+
+### 3.2 API-Enabled Custody (Modern Approach)
+
+**Seccl Tech**: UK-based FCA-regulated custodian offering:
+
+- Advanced automation
+- API-first architecture
+- Direct CREST membership (UK securities depository)
+- No third-party sub-custodians
+- Real-time data access
+
+**Reference**: [Seccl Tech - Custody & Investment Infrastructure](https://seccl.tech/services/custody-investment-infrastructure/)
+
+### 3.3 Integration Models
+
+**Model 1: Direct Custodian Integration**
+
+```
+Your System → API → Custodian → Market
+```
+
+- Pros: Full control, real-time data
+- Cons: Complex integration, costly
+
+**Model 2: Broker-Dealer Integration**
+
+```
+Your System → API → Broker → Custodian → Market
+```
+
+- Pros: Simplified, broker handles custody
+- Cons: Less control, additional layer
+
+**Model 3: Aggregation Platform**
+
+```
+Your System → API → Aggregator → Multiple Custodians/Brokers
+```
+
+- Pros: Single API, multiple destinations
+- Cons: Platform dependency
+
+---
+
+## 4. Reconciliation Process
+
+### 4.1 Investment Reconciliation Workflow
+
+**Source**: [Limina - Investment Reconciliation Guide](https://www.limina.com/blog/investment-reconciliation)
+
+**Daily Reconciliation Steps**:
+
+1. **Position Reconciliation** (Morning)
+
+   ```
+   Internal System Positions
+   ↕️ (Compare)
+   Custodian Position Report
+
+   → Identify breaks (discrepancies)
+   → Investigate reasons
+   → Resolve differences
+   ```
+
+2. **Trade Reconciliation** (Intraday)
+
+   ```
+   Order Management System Trades
+   ↕️ (Match)
+   Broker/Custodian Trade Confirmations
+
+   → Match by: Trade Date, ISIN, Quantity, Price
+   → Flag unmatched trades
+   → Resolve within T+1
+   ```
+
+3. **Cash Reconciliation** (End of Day)
+
+   ```
+   Internal Cash Ledger
+   ↕️ (Reconcile)
+   Bank/Custodian Cash Statement
+
+   → Match settlements
+   → Verify fees/commissions
+   → Adjust for timing differences
+   ```
+
+4. **NAV Reconciliation** (Daily)
+
+   ```
+   Internal NAV Calculation
+   ↕️ (Verify)
+   Fund Administrator NAV
+
+   → Ensure pricing accuracy
+   → Verify corporate actions
+   → Confirm valuations
+   ```
+
+### 4.2 AI-Powered Reconciliation (2026 Trend)
+
+**Modern Features**:
+
+- AI algorithms infer break reasons
+- ML recommends next steps
+- Automated comment suggestions
+- Reduces investigation time by 60-80%
+
+**Vendors**: AutoRek, BlackLine, Trintech
+
+**Reference**: [Gartner - Financial Reconciliation Solutions](https://www.gartner.com/reviews/market/financial-reconciliation-solutions)
+
+### 4.3 Best Practices
+
+1. **Automation**: Use APIs for data synchronization
+2. **Real-time Validation**: Check trades immediately
+3. **Exception Management**: Flag and route breaks automatically
+4. **Audit Trail**: Maintain complete history
+5. **Scalability**: Handle high transaction volumes
+6. **Integration**: Connect OMS ↔ Accounting ↔ Custodian
+
+**Reference**: [SolveXia - Finance Reconciliation Best Practices](https://www.solvexia.com/blog/finance-reconciliation-how-to-step-by-step-process)
+
+---
+
+## 5. Available Sandbox/Demo APIs
+
+### 5.1 Recommended: Alpaca Markets
+
+**Website**: [Alpaca Markets](https://alpaca.markets/)
+
+**Why Alpaca?**
+
+- ✅ **Paper Trading API**: No real money, perfect for demo
+- ✅ **Full Broker API**: Complete trading lifecycle
+- ✅ **Extensive Documentation**: Easy to integrate
+- ✅ **Sandbox Environment**: Safe testing
+- ✅ **Professional Support**: Active community
+- ✅ **Free Tier**: No cost for development
+
+**Capabilities**:
+
+- Order placement (market, limit, stop orders)
+- Real-time quotes and market data
+- Portfolio tracking
+- Transaction history
+- Account management
+- Webhooks for event notifications
+
+**API Example**:
+
+```javascript
+// Place buy order
+POST https://paper-api.alpaca.markets/v2/orders
 {
   "symbol": "AAPL",
-  "qty": "10",
+  "qty": 10,
   "side": "buy",
   "type": "market",
-  "time_in_force": "day",
-  "client_order_id": "GBS-JOURNEY-123-AAPL"
+  "time_in_force": "day"
 }
-```
 
-### 3.5 Order Response Example
-
-```json
+// Response
 {
   "id": "61e69015-8549-4bfd-b9c3-01e75843f47d",
-  "client_order_id": "GBS-JOURNEY-123-AAPL",
-  "created_at": "2021-03-16T18:38:01.942282Z",
-  "submitted_at": "2021-03-16T18:38:01.937734Z",
-  "filled_at": "2021-03-16T18:38:01.937734Z",
-  "symbol": "AAPL",
-  "asset_class": "us_equity",
-  "qty": "10",
+  "status": "filled",
+  "filled_avg_price": "150.00",
   "filled_qty": "10",
-  "filled_avg_price": "125.60",
-  "order_type": "market",
-  "side": "buy",
-  "status": "filled"
+  ...
 }
 ```
 
-### 3.6 Alpaca Python SDK Example
+### 5.2 Alternative: Financial Modeling Prep (FMP)
 
-```python
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+**Website**: [FMP Developer Portal](https://site.financialmodelingprep.com/developer/docs)
 
-trading_client = TradingClient('api-key', 'secret-key', paper=True)
-market_order_data = MarketOrderRequest(
-    symbol="SPY",
-    qty=0.023,
-    side=OrderSide.BUY,
-    time_in_force=TimeInForce.DAY
-)
-market_order = trading_client.submit_order(order_data=market_order_data)
-```
+**Features**:
 
-### 3.7 Alpaca Limitations
+- Mutual fund data (200,000+ funds)
+- Real-time quotes
+- Historical prices
+- Fund holdings
+- Performance metrics
 
-- Paper trading account does NOT simulate dividends
-- Paper trading account does NOT send order fill emails
-- Paper Only Account holders receive IEX market data only
-- Non-marketable orders wait until marketable
+**Use Case**: Data provider (not execution)
 
----
+**Reference**: [FMP Free Stock Market API](https://site.financialmodelingprep.com/developer/docs)
 
-## 4. Alternative: DriveWealth (Production-Grade)
+### 5.3 Alternative: Twelve Data
 
-### 4.1 DriveWealth Features
+**Website**: [Twelve Data - Mutual Funds APIs](https://twelvedata.com/news/introducing-mutual-funds-apis)
 
-- **Production-replica Sandbox (UAT)**: Test integration during development and after launch
-- **Patented Fracker® Technology**: Pioneered fractional share investing
-- **Global Platform**: Trading of US equities, mutual funds, ETFs, fixed income, and options
-- **Extended Hours**: Fractional equities trading from 4 AM to 8 PM Eastern (16 hours/day)
-- **Dollar-Based Trading**: Invest in dollar amounts rather than share quantities
+**Features**:
 
-### 4.2 DriveWealth API Features
+- 200,000+ international mutual funds
+- 50+ countries coverage
+- End-of-day quotes
+- Performance & risk data
+- Holdings information
+- Sustainability metrics
 
-```
-Sandbox Hostname: Different from production (hostname determines environment)
-Documentation: https://developer.drivewealth.com/
+**Use Case**: Mutual fund data enrichment
 
-Key Features:
-- OpenAPI-compliant spec available
-- Postman collection for testing
-- Quick Start guides
-- Fractional trading in 0.00000001 share increments
-- Market, Stop, MIT, and Limit orders
-```
+### 5.4 Alternative: OpenWealth Sandbox
 
-### 4.3 Security Requirements
+**Website**: [OpenWealth Association](https://openwealth.ch/)
 
-- All requests over HTTPS (plain HTTP fails)
-- API authentication required
-- Server-to-server communication only
-- Private keys should never be exposed in transit
+**Features**:
 
----
+- Industry-standard API for wealth management
+- Order placement for listed instruments
+- Real-time order status
+- Developer portal with test client
+- Secure sandbox environment
 
-## 5. India Options: Fintech Primitives (Mutual Funds)
+**Use Case**: Enterprise-grade integration (complex setup)
 
-### 5.1 Platform Overview
+**Reference**: [Synpulse8 - OpenWealth Sandbox](https://synpulse8.com/our-solutions/openwealth-sandbox)
 
-Fintech Primitives simplifies the Indian financial ecosystem into APIs - a cloud-based PaaS for mutual fund distribution.
+### 5.5 Mock/Testing Tools
 
-### 5.2 Sandbox Access
+**MockBank** ([MockBank.io](https://www.mockbank.io/))
 
-```
-Sandbox URL: https://s.finprim.com
-Production URL: https://api.fintechprimitives.com
-Documentation: https://fintechprimitives.com/docs/api/
-```
+- Open Banking & PSD2 sandbox
+- Model any customer/account/transaction
+- Admin console + internal API
+- No real bank limitations
 
-### 5.3 Key Features
+**GitHub Mock Trading APIs**:
 
-- **Mutual Fund Transaction APIs**: Purchase, Redemption, SIP, STP flows
-- **45+ AMC Support**: All major fund houses connected
-- **Portfolio Aggregation**: Holdings and transaction history across multiple fund houses
-- **Regulatory Compliance**: SEBI and AMFI compliant infrastructure
-- **Order Management & Reconciliation**: End-to-end tracking
-- **Analytics & Reporting**: Client statements, capital gain summaries
-
-### 5.4 Registration Requirements
-
-- OAuth 2.0 access via email to fpsupport@cybrilla.com
-- Enterprise plans include sandbox access, SLA-backed uptime
-- For SEBI-regulated institutions
+- [mock-trading-api](https://github.com/dmitriz/mock-trading-api) - Pure functions for testing
+- [Mock-Stocks](https://github.com/JackyTea/Mock-Stocks) - Full simulated trading app
 
 ---
 
-## 6. Reconciliation Process
+## 6. Recommended Solution for Demo
 
-### 6.1 What is Reconciliation?
+### 6.1 Hybrid Approach: Internal Mock + External Data
 
-Reconciliation ensures data consistency between:
-- **Internal System** (GBS database)
-- **External Broker** (Alpaca/Custodian)
-- **Custodian** (holds actual assets)
-
-### 6.2 Three-Way Reconciliation
+**Architecture**:
 
 ```
-┌─────────────────┐
-│   GBS System    │ ←──┐
-│  (Our Records)  │    │
-└────────┬────────┘    │
-         │             │ Compare & Verify
-         v             │
-┌─────────────────┐    │
-│  Broker/API     │ ←──┤
-│   (Alpaca)      │    │
-└────────┬────────┘    │
-         │             │
-         v             │
-┌─────────────────┐    │
-│   Custodian     │ ←──┘
-│ (Asset Holder)  │
-└─────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    GBS Application                       │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  ┌────────────────────────────────────────────────┐    │
+│  │         Investment Execution Module             │    │
+│  │  (Your Custom Implementation)                   │    │
+│  └────────────────────────────────────────────────┘    │
+│           │                     │                        │
+│           ↓                     ↓                        │
+│  ┌─────────────────┐   ┌─────────────────────┐        │
+│  │  Mock Custodian │   │   Real Market Data   │        │
+│  │   (Internal)    │   │  (Alpaca/FMP/12Data) │        │
+│  │                 │   │                       │        │
+│  │ - Trade Exec    │   │ - Prices             │        │
+│  │ - Settlement    │   │ - Fund Info          │        │
+│  │ - Confirmations │   │ - Historical Data    │        │
+│  └─────────────────┘   └─────────────────────┘        │
+│           │                     │                        │
+│           ↓                     ↓                        │
+│  ┌─────────────────────────────────────────────────┐  │
+│  │         Transaction Record Database              │  │
+│  │  - Orders | Executions | Settlements | Holdings │  │
+│  └─────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### 6.3 Types of Reconciliation
+### 6.2 Why This Approach?
 
-| Type | Frequency | What to Compare |
-|------|-----------|-----------------|
-| **Trade Reconciliation** | T+0 to T+1 | Trade ID, Fill Price, Quantity, Timestamp |
-| **Position Reconciliation** | Daily | Symbol, Quantity, Market Value |
-| **Cash Reconciliation** | Daily | Available Cash, Buying Power, Currency |
-| **NAV Reconciliation** | Daily | Portfolio valuations |
+**For Demo**:
 
-### 6.4 Reconciliation Workflow
+- ✅ Full control over execution flow
+- ✅ No external dependencies for core functionality
+- ✅ Realistic data from market APIs
+- ✅ Complete audit trail
+- ✅ Fast development
+- ✅ Cost-effective (free tier APIs)
 
-```
-1. DATA COLLECTION
-   ├─ Pull internal positions from OMS
-   ├─ Receive custodian statement (MT535/API)
-   └─ Get NAV from pricing service
+**For Production**:
 
-2. MATCHING
-   ├─ Match by: Security ID + Account + Quantity + Settlement Date
-   ├─ Identify: MATCHED, UNMATCHED, BREAKS
-   └─ Calculate: Variances
+- 🔄 Replace mock custodian with client's real custodian API
+- 🔄 Keep transaction database schema
+- 🔄 Keep reconciliation logic
+- 🔄 Add real compliance checks
+- 🔄 Integrate with actual settlement system
 
-3. BREAK INVESTIGATION
-   ├─ Timing differences (T+1 vs T+2)
-   ├─ Corporate actions (splits, dividends)
-   ├─ Failed trades
-   └─ Data entry errors
+### 6.3 Demo vs Production Comparison
 
-4. RESOLUTION
-   ├─ Auto-resolve minor variances
-   ├─ Escalate significant breaks
-   └─ Adjust positions if needed
-
-5. REPORTING
-   ├─ Reconciliation summary
-   ├─ Break report
-   └─ Audit trail
-```
+| Component           | Demo Implementation      | Production Implementation                    |
+| ------------------- | ------------------------ | -------------------------------------------- |
+| **Order Execution** | Simulated (instant fill) | Real broker API (market execution)           |
+| **Market Data**     | Alpaca/FMP (real prices) | Client's market data feed                    |
+| **Settlement**      | Mock (instant T+0)       | Real settlement (T+1/T+2)                    |
+| **Custodian**       | Internal mock service    | BNY Mellon / State Street / Client custodian |
+| **Reconciliation**  | Automated (same system)  | Multi-party reconciliation                   |
+| **Compliance**      | Basic checks             | Full regulatory compliance                   |
+| **Reporting**       | Standard reports         | Client-specific + regulatory reports         |
 
 ---
 
 ## 7. Implementation Architecture
 
-### 7.1 Database Schema
+### 7.1 High-Level Component Design
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Frontend (Angular)                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐ │
+│  │  Order Execution │  │  Order History   │  │ Reconciliation│ │
+│  │     Dashboard    │  │     & Status     │  │    Reports    │ │
+│  └──────────────────┘  └──────────────────┘  └──────────────┘ │
+│           │                     │                     │          │
+└───────────┼─────────────────────┼─────────────────────┼──────────┘
+            │                     │                     │
+            ↓                     ↓                     ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                      Backend (Spring Boot)                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │              Investment Execution Service               │    │
+│  │                                                          │    │
+│  │  • Order Creation & Validation                          │    │
+│  │  • Order Routing                                        │    │
+│  │  • Execution Simulation                                 │    │
+│  │  • Settlement Processing                                │    │
+│  │  • Position Management                                  │    │
+│  └────────────────────────────────────────────────────────┘    │
+│           │                 │                 │                  │
+│           ↓                 ↓                 ↓                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐    │
+│  │   Order      │  │  Execution   │  │  Reconciliation  │    │
+│  │  Repository  │  │  Repository  │  │   Repository     │    │
+│  └──────────────┘  └──────────────┘  └──────────────────┘    │
+│           │                 │                 │                  │
+└───────────┼─────────────────┼─────────────────┼──────────────────┘
+            │                 │                 │
+            ↓                 ↓                 ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    PostgreSQL Database                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  • investment_order         (order details)                     │
+│  • order_execution          (execution records)                 │
+│  • settlement               (settlement tracking)               │
+│  • holding                  (current positions)                 │
+│  • reconciliation_log       (reconciliation records)            │
+│  • transaction_audit        (complete audit trail)              │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+            │                                      │
+            ↓ (Optional for Demo)                  ↓
+┌─────────────────────────────┐      ┌───────────────────────────┐
+│    External Market Data     │      │   Mock Custodian Service  │
+│   (Alpaca/FMP/TwelveData)   │      │      (Your Own API)       │
+│                             │      │                           │
+│  • Real-time prices         │      │  • Instant execution      │
+│  • Fund information         │      │  • Confirmations          │
+│  • Historical data          │      │  • Settlement simulation  │
+└─────────────────────────────┘      └───────────────────────────┘
+```
+
+### 7.2 Process Flow: Order to Settlement
+
+```
+Step 1: PROPOSAL ACCEPTED
+  │
+  ├─ Customer accepts proposal in their portal
+  ├─ Proposal.status: NEW → ACCEPTED
+  └─ Trigger: Create investment orders
+      │
+      ↓
+Step 2: ORDER CREATION
+  │
+  ├─ For each fund allocation in proposal:
+  │   └─ Create InvestmentOrder
+  │       • Goal ID
+  │       • Proposal ID
+  │       • Fund ID (HDFC Top 100, ICICI Bluechip, etc.)
+  │       • Target Amount
+  │       • Order Type (BUY)
+  │       • Status: PENDING
+  │
+  └─ RM reviews orders in "Order Execution Dashboard"
+      │
+      ↓
+Step 3: ORDER VALIDATION
+  │
+  ├─ Pre-execution checks:
+  │   • Customer has available funds?
+  │   • Fund is available for purchase?
+  │   • Complies with suitability?
+  │   • Within investment limits?
+  │
+  ├─ If validation fails:
+  │   └─ Order.status: REJECTED + reason
+  │
+  └─ If validation passes:
+      └─ Order.status: PENDING → VALIDATED
+          │
+          ↓
+Step 4: ORDER ROUTING & EXECUTION (Mock Custodian)
+  │
+  ├─ Send order to Mock Custodian API
+  │   POST /api/custodian/execute-order
+  │   {
+  │     "orderId": "ORD-123",
+  │     "fundISIN": "INF204K01YM1",
+  │     "fundName": "HDFC Top 100 Fund",
+  │     "quantity": 100,  // units
+  │     "amount": 500000
+  │   }
+  │
+  ├─ Mock Custodian response (simulated):
+  │   {
+  │     "executionId": "EXE-456",
+  │     "status": "FILLED",
+  │     "executedPrice": 5000,  // NAV per unit
+  │     "executedQuantity": 100,
+  │     "executedAmount": 500000,
+  │     "executionTime": "2026-01-06T10:30:00Z",
+  │     "transactionId": "TXN-789"
+  │   }
+  │
+  └─ Create OrderExecution record
+      • Link to InvestmentOrder
+      • Execution details
+      • Status: EXECUTED
+      │
+      ↓
+Step 5: SETTLEMENT PROCESSING
+  │
+  ├─ Create Settlement record:
+  │   • Execution ID
+  │   • Settlement Date (T+1 for demo, instant for simplicity)
+  │   • Status: PENDING → SETTLED
+  │   • Custodian Confirmation Number
+  │
+  └─ Update account holdings:
+      • Create/Update Holding record
+      • Fund: HDFC Top 100
+      • Quantity: 100 units
+      • Average Cost: 5000/unit
+      • Current Value: 500000
+      │
+      ↓
+Step 6: RECONCILIATION
+  │
+  ├─ Daily reconciliation job:
+  │   • Compare internal holdings vs custodian report
+  │   • Match order executions
+  │   • Verify cash movements
+  │
+  └─ Create ReconciliationLog:
+      • Date
+      • Status: MATCHED / BREAK
+      • Discrepancies (if any)
+      • Resolution notes
+      │
+      ↓
+Step 7: REPORTING & NOTIFICATIONS
+  │
+  ├─ Generate reports:
+  │   • Order execution summary
+  │   • Settlement confirmation
+  │   • Updated portfolio statement
+  │
+  └─ Send notifications:
+      • Email to customer: "Your investment of ₹5,00,000 in HDFC Top 100 is confirmed"
+      • SMS confirmation
+      • Update customer portal dashboard
+```
+
+### 7.3 State Machine: Order Status
+
+```
+CREATED
+  ↓
+VALIDATED (pre-execution checks passed)
+  ↓
+SUBMITTED (sent to custodian)
+  ↓
+PARTIALLY_FILLED (partial execution)
+  ↓
+FILLED (fully executed)
+  ↓
+SETTLING (settlement in progress)
+  ↓
+SETTLED (settlement complete)
+
+Alternative paths:
+CREATED → REJECTED (validation failed)
+SUBMITTED → CANCELLED (cancelled by RM)
+FILLED → SETTLEMENT_FAILED → PENDING_INVESTIGATION
+```
+
+---
+
+## 8. Data Model Design
+
+### 8.1 Entity Relationship Diagram
+
+```
+┌──────────────────┐
+│      Goal        │
+└──────────────────┘
+         │ 1
+         │
+         │ *
+┌──────────────────┐
+│    Proposal      │
+└──────────────────┘
+         │ 1
+         │
+         │ *
+┌──────────────────────────┐
+│   InvestmentOrder        │  (New Entity)
+│                          │
+│  • id                    │
+│  • proposalId (FK)       │
+│  • goalId (FK)           │
+│  • customerId (FK)       │
+│  • rmId (FK)             │
+│  • fundId (FK)           │
+│  • orderType             │  (BUY, SELL)
+│  • orderStatus           │  (CREATED, VALIDATED, SUBMITTED...)
+│  • targetAmount          │
+│  • targetQuantity        │
+│  • orderDate             │
+│  • validUntil            │
+│  • externalOrderId       │  (from custodian)
+│  • createdAt             │
+│  • updatedAt             │
+└──────────────────────────┘
+         │ 1
+         │
+         │ 1
+┌──────────────────────────┐
+│   OrderExecution         │  (New Entity)
+│                          │
+│  • id                    │
+│  • orderId (FK)          │
+│  • executionId           │  (from custodian)
+│  • executedPrice         │  (NAV per unit)
+│  • executedQuantity      │
+│  • executedAmount        │
+│  • executionTime         │
+│  • executionStatus       │  (FILLED, PARTIAL, FAILED)
+│  • transactionId         │
+│  • brokerage             │
+│  • taxes                 │
+│  • otherCharges          │
+│  • totalCost             │
+│  • confirmationNumber    │
+│  • createdAt             │
+└──────────────────────────┘
+         │ 1
+         │
+         │ 1
+┌──────────────────────────┐
+│     Settlement           │  (New Entity)
+│                          │
+│  • id                    │
+│  • executionId (FK)      │
+│  • settlementDate        │
+│  • settlementStatus      │  (PENDING, SETTLED, FAILED)
+│  • custodianReference    │
+│  • clearingHouse         │
+│  • settledAmount         │
+│  • settledQuantity       │
+│  • settledAt             │
+│  • createdAt             │
+└──────────────────────────┘
+         │ 1
+         │
+         │ *
+┌──────────────────────────┐
+│       Holding            │  (New Entity)
+│                          │
+│  • id                    │
+│  • customerId (FK)       │
+│  • goalId (FK)           │
+│  • fundId (FK)           │
+│  • quantity              │
+│  • averageCost           │
+│  • currentValue          │
+│  • unrealizedGain        │
+│  • lastUpdated           │
+│  • createdAt             │
+└──────────────────────────┘
+         │ *
+         │
+         │ *
+┌──────────────────────────┐
+│   ReconciliationLog      │  (New Entity)
+│                          │
+│  • id                    │
+│  • reconciliationDate    │
+│  • entityType            │  (ORDER, POSITION, CASH)
+│  • entityId              │
+│  • internalValue         │
+│  • custodianValue        │
+│  • variance              │
+│  • status                │  (MATCHED, BREAK, RESOLVED)
+│  • breakReason           │
+│  • resolutionNotes       │
+│  • resolvedBy            │
+│  • resolvedAt            │
+│  • createdAt             │
+└──────────────────────────┘
+```
+
+### 8.2 SQL Schema
 
 ```sql
 -- Investment Order table
 CREATE TABLE investment_order (
     id BIGSERIAL PRIMARY KEY,
-    journey_tracking_id BIGINT REFERENCES goal_journey_tracking(id),
-    proposal_id BIGINT REFERENCES proposal(id),
-    customer_id BIGINT REFERENCES customer(id),
+    proposal_id BIGINT NOT NULL REFERENCES proposal(id),
+    goal_id BIGINT NOT NULL REFERENCES goal(id),
+    customer_id BIGINT NOT NULL REFERENCES users(id),
+    rm_id BIGINT NOT NULL REFERENCES users(id),
+    fund_id BIGINT NOT NULL REFERENCES fund(id),
 
-    -- Order Details
-    order_type VARCHAR(20) NOT NULL, -- MARKET, LIMIT
-    side VARCHAR(10) NOT NULL, -- BUY, SELL
-    symbol VARCHAR(20) NOT NULL,
-    asset_class_id BIGINT REFERENCES asset_class(id),
+    order_type VARCHAR(10) NOT NULL CHECK (order_type IN ('BUY', 'SELL')),
+    order_status VARCHAR(30) NOT NULL DEFAULT 'CREATED'
+        CHECK (order_status IN ('CREATED', 'VALIDATED', 'SUBMITTED', 'PARTIALLY_FILLED',
+                                'FILLED', 'SETTLING', 'SETTLED', 'REJECTED', 'CANCELLED', 'FAILED')),
 
-    -- Quantities
-    requested_qty DECIMAL(18,8),
-    requested_amount DECIMAL(18,2), -- For fractional/notional orders
-    filled_qty DECIMAL(18,8),
-    filled_avg_price DECIMAL(18,4),
+    target_amount DECIMAL(15, 2) NOT NULL,
+    target_quantity DECIMAL(15, 4),
 
-    -- Status Tracking
-    status VARCHAR(30) NOT NULL, -- PENDING, SUBMITTED, FILLED, SETTLED, REJECTED
+    order_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    valid_until TIMESTAMP,
 
-    -- External References
-    broker_order_id VARCHAR(100), -- Alpaca order ID
-    client_order_id VARCHAR(100) UNIQUE, -- Our reference
+    external_order_id VARCHAR(100),  -- Custodian's order ID
 
-    -- Timestamps
-    submitted_at TIMESTAMP,
-    filled_at TIMESTAMP,
+    rejection_reason TEXT,
+    cancellation_reason TEXT,
+
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_proposal FOREIGN KEY (proposal_id) REFERENCES proposal(id),
+    CONSTRAINT fk_goal FOREIGN KEY (goal_id) REFERENCES goal(id),
+    CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES users(id),
+    CONSTRAINT fk_rm FOREIGN KEY (rm_id) REFERENCES users(id),
+    CONSTRAINT fk_fund FOREIGN KEY (fund_id) REFERENCES fund(id)
+);
+
+CREATE INDEX idx_order_proposal ON investment_order(proposal_id);
+CREATE INDEX idx_order_goal ON investment_order(goal_id);
+CREATE INDEX idx_order_customer ON investment_order(customer_id);
+CREATE INDEX idx_order_status ON investment_order(order_status);
+CREATE INDEX idx_order_date ON investment_order(order_date);
+
+-- Order Execution table
+CREATE TABLE order_execution (
+    id BIGSERIAL PRIMARY KEY,
+    order_id BIGINT NOT NULL REFERENCES investment_order(id),
+
+    execution_id VARCHAR(100) NOT NULL UNIQUE,  -- From custodian
+
+    executed_price DECIMAL(15, 4) NOT NULL,  -- NAV per unit
+    executed_quantity DECIMAL(15, 4) NOT NULL,
+    executed_amount DECIMAL(15, 2) NOT NULL,
+
+    execution_time TIMESTAMP NOT NULL,
+    execution_status VARCHAR(20) NOT NULL CHECK (execution_status IN ('FILLED', 'PARTIAL', 'FAILED')),
+
+    transaction_id VARCHAR(100),  -- Custodian transaction ID
+
+    -- Charges
+    brokerage DECIMAL(10, 2) DEFAULT 0,
+    taxes DECIMAL(10, 2) DEFAULT 0,
+    other_charges DECIMAL(10, 2) DEFAULT 0,
+    total_cost DECIMAL(15, 2) NOT NULL,  -- executed_amount + charges
+
+    confirmation_number VARCHAR(100),
+
+    notes TEXT,
+
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_order FOREIGN KEY (order_id) REFERENCES investment_order(id)
+);
+
+CREATE INDEX idx_execution_order ON order_execution(order_id);
+CREATE INDEX idx_execution_time ON order_execution(execution_time);
+CREATE INDEX idx_execution_status ON order_execution(execution_status);
+
+-- Settlement table
+CREATE TABLE settlement (
+    id BIGSERIAL PRIMARY KEY,
+    execution_id BIGINT NOT NULL REFERENCES order_execution(id),
+
+    settlement_date DATE NOT NULL,  -- T+1, T+2, etc.
+    settlement_status VARCHAR(20) NOT NULL DEFAULT 'PENDING'
+        CHECK (settlement_status IN ('PENDING', 'IN_PROGRESS', 'SETTLED', 'FAILED', 'INVESTIGATING')),
+
+    custodian_reference VARCHAR(100),
+    clearing_house VARCHAR(100),
+
+    settled_amount DECIMAL(15, 2),
+    settled_quantity DECIMAL(15, 4),
     settled_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP,
 
-    -- Error Handling
-    error_message TEXT,
-    retry_count INT DEFAULT 0
+    failure_reason TEXT,
+
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_execution FOREIGN KEY (execution_id) REFERENCES order_execution(id)
 );
 
--- Investment Execution Summary (per journey)
-CREATE TABLE investment_execution (
+CREATE INDEX idx_settlement_execution ON settlement(execution_id);
+CREATE INDEX idx_settlement_date ON settlement(settlement_date);
+CREATE INDEX idx_settlement_status ON settlement(settlement_status);
+
+-- Holding table (current positions)
+CREATE TABLE holding (
     id BIGSERIAL PRIMARY KEY,
-    journey_tracking_id BIGINT REFERENCES goal_journey_tracking(id),
-    proposal_id BIGINT REFERENCES proposal(id),
-    customer_id BIGINT REFERENCES customer(id),
-    portfolio_id BIGINT REFERENCES model_portfolio(id),
+    customer_id BIGINT NOT NULL REFERENCES users(id),
+    goal_id BIGINT NOT NULL REFERENCES goal(id),
+    fund_id BIGINT NOT NULL REFERENCES fund(id),
 
-    -- Investment Summary
-    total_investment_amount DECIMAL(18,2) NOT NULL,
-    executed_amount DECIMAL(18,2) DEFAULT 0,
-    pending_amount DECIMAL(18,2) DEFAULT 0,
+    quantity DECIMAL(15, 4) NOT NULL DEFAULT 0,
+    average_cost DECIMAL(15, 4) NOT NULL,  -- Average purchase price per unit
 
-    -- Status
-    execution_status VARCHAR(30) NOT NULL, -- PENDING, IN_PROGRESS, COMPLETED, FAILED
+    current_nav DECIMAL(15, 4),  -- Current NAV per unit (updated daily)
+    current_value DECIMAL(15, 2),  -- quantity * current_nav
 
-    -- Broker Info
-    broker_account_id VARCHAR(100),
+    invested_amount DECIMAL(15, 2) NOT NULL,  -- Total amount invested
+    unrealized_gain DECIMAL(15, 2),  -- current_value - invested_amount
+    unrealized_gain_percentage DECIMAL(8, 4),  -- (unrealized_gain / invested_amount) * 100
 
-    -- Timestamps
-    initiated_at TIMESTAMP,
-    completed_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-    -- Audit
-    initiated_by BIGINT REFERENCES users(id)
+    CONSTRAINT fk_holding_customer FOREIGN KEY (customer_id) REFERENCES users(id),
+    CONSTRAINT fk_holding_goal FOREIGN KEY (goal_id) REFERENCES goal(id),
+    CONSTRAINT fk_holding_fund FOREIGN KEY (fund_id) REFERENCES fund(id),
+    CONSTRAINT unique_holding UNIQUE (customer_id, goal_id, fund_id)
 );
 
--- Position Snapshot (for reconciliation)
-CREATE TABLE position_snapshot (
-    id BIGSERIAL PRIMARY KEY,
-    customer_id BIGINT REFERENCES customer(id),
-    execution_id BIGINT REFERENCES investment_execution(id),
+CREATE INDEX idx_holding_customer ON holding(customer_id);
+CREATE INDEX idx_holding_goal ON holding(goal_id);
+CREATE INDEX idx_holding_fund ON holding(fund_id);
 
-    symbol VARCHAR(20) NOT NULL,
-    asset_class_id BIGINT REFERENCES asset_class(id),
-    quantity DECIMAL(18,8) NOT NULL,
-    avg_cost DECIMAL(18,4),
-    market_value DECIMAL(18,2),
-    unrealized_pnl DECIMAL(18,2),
-
-    -- Source
-    source VARCHAR(20) NOT NULL, -- BROKER, INTERNAL
-    snapshot_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Reconciliation Records
-CREATE TABLE reconciliation_record (
+-- Reconciliation Log table
+CREATE TABLE reconciliation_log (
     id BIGSERIAL PRIMARY KEY,
     reconciliation_date DATE NOT NULL,
-    reconciliation_type VARCHAR(20) NOT NULL, -- POSITION, TRADE, CASH
-    status VARCHAR(20) NOT NULL, -- PENDING, MATCHED, UNMATCHED, RESOLVED
 
-    customer_id BIGINT REFERENCES customer(id),
-    asset_class_id BIGINT REFERENCES asset_class(id),
+    entity_type VARCHAR(20) NOT NULL CHECK (entity_type IN ('ORDER', 'EXECUTION', 'POSITION', 'CASH')),
+    entity_id BIGINT NOT NULL,  -- ID of the entity being reconciled
 
-    -- Internal values
-    internal_quantity DECIMAL(18,8),
-    internal_value DECIMAL(18,2),
+    internal_value DECIMAL(15, 4),
+    custodian_value DECIMAL(15, 4),
+    variance DECIMAL(15, 4),  -- internal_value - custodian_value
+    variance_percentage DECIMAL(8, 4),
 
-    -- External (Custodian) values
-    custodian_quantity DECIMAL(18,8),
-    custodian_value DECIMAL(18,2),
-
-    -- Variance
-    quantity_variance DECIMAL(18,8),
-    value_variance DECIMAL(18,2),
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING'
+        CHECK (status IN ('MATCHED', 'BREAK', 'INVESTIGATING', 'RESOLVED', 'EXCEPTION')),
 
     break_reason TEXT,
-    resolution TEXT,
+    resolution_notes TEXT,
+
+    resolved_by BIGINT REFERENCES users(id),
     resolved_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-```
 
-### 7.2 Service Architecture
+CREATE INDEX idx_recon_date ON reconciliation_log(reconciliation_date);
+CREATE INDEX idx_recon_status ON reconciliation_log(status);
+CREATE INDEX idx_recon_entity ON reconciliation_log(entity_type, entity_id);
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     InvestmentExecutionService                   │
-├─────────────────────────────────────────────────────────────────┤
-│ + initiateInvestment(proposalId, amount)                        │
-│ + executeOrders(executionId)                                     │
-│ + getExecutionStatus(executionId)                                │
-│ + reconcilePositions(executionId)                                │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ uses
-                              v
-┌─────────────────────────────────────────────────────────────────┐
-│                      BrokerIntegrationService                    │
-│                      (Interface - Strategy Pattern)              │
-├─────────────────────────────────────────────────────────────────┤
-│ + placeOrder(OrderRequest)                                       │
-│ + getOrderStatus(orderId)                                        │
-│ + cancelOrder(orderId)                                           │
-│ + getPositions()                                                 │
-│ + getAccountInfo()                                               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              │               │               │
-              v               v               v
-┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│ AlpacaBroker    │ │ MockBroker      │ │ DriveWealth     │
-│ (Paper Trading) │ │ (Local Demo)    │ │ (Production)    │
-└─────────────────┘ └─────────────────┘ └─────────────────┘
-```
+-- Transaction Audit table (immutable audit trail)
+CREATE TABLE transaction_audit (
+    id BIGSERIAL PRIMARY KEY,
+    transaction_type VARCHAR(30) NOT NULL,  -- ORDER_CREATED, EXECUTION, SETTLEMENT, etc.
+    reference_id BIGINT NOT NULL,  -- ID of related entity
+    reference_type VARCHAR(30) NOT NULL,  -- ORDER, EXECUTION, SETTLEMENT, etc.
 
-### 7.3 Investment Flow Sequence
+    event_timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-```
-┌─────────┐     ┌─────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────┐
-│Customer │     │   RM    │     │ GBS Backend │     │   Alpaca    │     │   DB    │
-└────┬────┘     └────┬────┘     └──────┬──────┘     └──────┬──────┘     └────┬────┘
-     │               │                  │                   │                 │
-     │  Accept       │                  │                   │                 │
-     │  Proposal     │                  │                   │                 │
-     │──────────────>│                  │                   │                 │
-     │               │                  │                   │                 │
-     │               │ Initiate         │                   │                 │
-     │               │ Investment       │                   │                 │
-     │               │─────────────────>│                   │                 │
-     │               │                  │                   │                 │
-     │               │                  │ Create Execution  │                 │
-     │               │                  │──────────────────────────────────>  │
-     │               │                  │                   │                 │
-     │               │                  │ Calculate Orders  │                 │
-     │               │                  │ (Based on         │                 │
-     │               │                  │  Portfolio        │                 │
-     │               │                  │  Allocation)      │                 │
-     │               │                  │                   │                 │
-     │               │                  │ Place Order       │                 │
-     │               │                  │ (for each asset)  │                 │
-     │               │                  │──────────────────>│                 │
-     │               │                  │                   │                 │
-     │               │                  │   Order Filled    │                 │
-     │               │                  │<──────────────────│                 │
-     │               │                  │                   │                 │
-     │               │                  │ Save Order Record │                 │
-     │               │                  │──────────────────────────────────>  │
-     │               │                  │                   │                 │
-     │               │                  │ Update Positions  │                 │
-     │               │                  │──────────────────────────────────>  │
-     │               │                  │                   │                 │
-     │               │  Execution       │                   │                 │
-     │               │  Complete        │                   │                 │
-     │               │<─────────────────│                   │                 │
-     │               │                  │                   │                 │
-     │  Investment   │                  │                   │                 │
-     │  Confirmed    │                  │                   │                 │
-     │<──────────────│                  │                   │                 │
+    user_id BIGINT REFERENCES users(id),
+    user_role VARCHAR(20),
+
+    before_state JSONB,  -- State before the change
+    after_state JSONB,   -- State after the change
+
+    metadata JSONB,  -- Additional context (IP, browser, etc.)
+
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_audit_type ON transaction_audit(transaction_type);
+CREATE INDEX idx_audit_ref ON transaction_audit(reference_type, reference_id);
+CREATE INDEX idx_audit_timestamp ON transaction_audit(event_timestamp);
+CREATE INDEX idx_audit_user ON transaction_audit(user_id);
 ```
 
 ---
 
-## 8. Demo Implementation Strategy
+## 9. API Endpoints
 
-### 8.1 Phase 1: Mock Broker (Immediate Demo)
+### 9.1 Order Management APIs
 
-For the initial demo, implement a **MockBrokerService** that:
-- Simulates order execution instantly
-- Uses static/seeded price data
-- Returns realistic order responses
-- Stores all records in database
+#### Create Investment Orders (After Proposal Acceptance)
 
-**Advantages:**
-- No external dependencies
-- Works offline
-- Fully controlled behavior
-- Instant execution
+```http
+POST /api/v1/investment/orders/create-from-proposal
+Authorization: Bearer {token}
+Content-Type: application/json
 
-### 8.2 Phase 2: Alpaca Paper Trading (Enhanced Demo)
+Request:
+{
+  "proposalId": 123,
+  "customerId": 456,
+  "rmId": 789
+}
 
-Integrate Alpaca's paper trading for:
-- Real market data
-- Realistic order execution
-- Actual price movements
-- Portfolio tracking
+Response (201 Created):
+{
+  "success": true,
+  "message": "Investment orders created successfully",
+  "data": {
+    "ordersCreated": 5,
+    "orders": [
+      {
+        "id": 1001,
+        "fundId": 10,
+        "fundName": "HDFC Top 100 Fund",
+        "fundCode": "HDFC_TOP100",
+        "targetAmount": 500000,
+        "targetQuantity": 100,
+        "orderStatus": "CREATED",
+        "orderDate": "2026-01-06T10:00:00Z"
+      },
+      {
+        "id": 1002,
+        "fundId": 11,
+        "fundName": "ICICI Prudential Bluechip",
+        "fundCode": "ICICI_BLUECHIP",
+        "targetAmount": 300000,
+        "targetQuantity": 60,
+        "orderStatus": "CREATED",
+        "orderDate": "2026-01-06T10:00:00Z"
+      }
+      // ... more orders
+    ]
+  }
+}
+```
 
-**Setup Required:**
-1. Create Alpaca account (free)
-2. Get API keys
-3. Configure paper trading endpoint
-4. Add `alpaca-java` Maven dependency
+#### Get Order by ID
 
-### 8.3 Phase 3: Production Custodian (Client Integration)
+```http
+GET /api/v1/investment/orders/{orderId}
+Authorization: Bearer {token}
 
-Client provides their custodian integration:
-- DriveWealth, Interactive Brokers, etc.
-- Custom FIX protocol integration
-- Real money transactions
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "id": 1001,
+    "proposalId": 123,
+    "goalId": 50,
+    "customerId": 456,
+    "customerName": "Sujit Rujuk",
+    "rmId": 789,
+    "rmName": "Rajesh Kumar",
+    "fundId": 10,
+    "fundName": "HDFC Top 100 Fund",
+    "fundCode": "HDFC_TOP100",
+    "fundISIN": "INF204K01YM1",
+    "orderType": "BUY",
+    "orderStatus": "VALIDATED",
+    "targetAmount": 500000,
+    "targetQuantity": 100,
+    "orderDate": "2026-01-06T10:00:00Z",
+    "validUntil": "2026-01-06T18:00:00Z",
+    "externalOrderId": null,
+    "createdAt": "2026-01-06T10:00:00Z",
+    "updatedAt": "2026-01-06T10:05:00Z",
+
+    // Nested execution if exists
+    "execution": null
+  }
+}
+```
+
+#### Get All Orders for Proposal
+
+```http
+GET /api/v1/investment/orders/proposal/{proposalId}
+Authorization: Bearer {token}
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "proposalId": 123,
+    "totalOrders": 5,
+    "totalTargetAmount": 3500000,
+    "statusSummary": {
+      "CREATED": 2,
+      "VALIDATED": 2,
+      "SUBMITTED": 1,
+      "FILLED": 0,
+      "SETTLED": 0
+    },
+    "orders": [
+      {
+        "id": 1001,
+        "fundName": "HDFC Top 100 Fund",
+        "targetAmount": 500000,
+        "orderStatus": "VALIDATED"
+      }
+      // ... more orders
+    ]
+  }
+}
+```
+
+#### Get All Orders for Customer
+
+```http
+GET /api/v1/investment/orders/customer/{customerId}
+Authorization: Bearer {token}
+Query Parameters:
+  - status (optional): CREATED, VALIDATED, FILLED, SETTLED
+  - fromDate (optional): 2026-01-01
+  - toDate (optional): 2026-01-31
+  - page (default: 0)
+  - size (default: 20)
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "content": [
+      {
+        "id": 1001,
+        "proposalId": 123,
+        "goalName": "Retirement Planning",
+        "fundName": "HDFC Top 100 Fund",
+        "orderType": "BUY",
+        "orderStatus": "SETTLED",
+        "targetAmount": 500000,
+        "executedAmount": 500000,
+        "orderDate": "2026-01-06T10:00:00Z",
+        "executionTime": "2026-01-06T10:30:00Z",
+        "settlementDate": "2026-01-07"
+      }
+    ],
+    "page": 0,
+    "size": 20,
+    "totalElements": 50,
+    "totalPages": 3
+  }
+}
+```
+
+### 9.2 Order Execution APIs
+
+#### Validate Order (Pre-execution checks)
+
+```http
+POST /api/v1/investment/orders/{orderId}/validate
+Authorization: Bearer {token}
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "orderId": 1001,
+    "validationStatus": "PASSED",
+    "checks": [
+      {
+        "checkType": "FUNDS_AVAILABILITY",
+        "status": "PASSED",
+        "message": "Customer has sufficient funds"
+      },
+      {
+        "checkType": "FUND_AVAILABILITY",
+        "status": "PASSED",
+        "message": "Fund is available for purchase"
+      },
+      {
+        "checkType": "SUITABILITY_COMPLIANCE",
+        "status": "PASSED",
+        "message": "Investment complies with customer suitability"
+      },
+      {
+        "checkType": "INVESTMENT_LIMITS",
+        "status": "PASSED",
+        "message": "Within investment limits"
+      }
+    ],
+    "validatedAt": "2026-01-06T10:05:00Z"
+  }
+}
+
+Response (if validation fails - 400 Bad Request):
+{
+  "success": false,
+  "message": "Order validation failed",
+  "data": {
+    "orderId": 1001,
+    "validationStatus": "FAILED",
+    "checks": [
+      {
+        "checkType": "FUNDS_AVAILABILITY",
+        "status": "FAILED",
+        "message": "Insufficient funds. Available: ₹300,000, Required: ₹500,000"
+      }
+    ],
+    "validatedAt": "2026-01-06T10:05:00Z"
+  }
+}
+```
+
+#### Execute Order (Submit to mock custodian)
+
+```http
+POST /api/v1/investment/orders/{orderId}/execute
+Authorization: Bearer {token}
+
+Response (200 OK):
+{
+  "success": true,
+  "message": "Order executed successfully",
+  "data": {
+    "orderId": 1001,
+    "executionId": "EXE-456",
+    "executionStatus": "FILLED",
+    "executedPrice": 5000,  // NAV per unit
+    "executedQuantity": 100,
+    "executedAmount": 500000,
+    "brokerage": 250,
+    "taxes": 90,
+    "otherCharges": 50,
+    "totalCost": 500390,
+    "executionTime": "2026-01-06T10:30:00Z",
+    "confirmationNumber": "CONF-789",
+    "transactionId": "TXN-123"
+  }
+}
+
+Response (if execution fails - 400 Bad Request):
+{
+  "success": false,
+  "message": "Order execution failed",
+  "error": {
+    "code": "EXECUTION_FAILED",
+    "reason": "Market is closed",
+    "details": "Trading hours: 9:15 AM - 3:30 PM IST"
+  }
+}
+```
+
+#### Get Execution Details
+
+```http
+GET /api/v1/investment/executions/{executionId}
+Authorization: Bearer {token}
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "id": 456,
+    "executionId": "EXE-456",
+    "orderId": 1001,
+    "orderDetails": {
+      "fundName": "HDFC Top 100 Fund",
+      "orderType": "BUY"
+    },
+    "executedPrice": 5000,
+    "executedQuantity": 100,
+    "executedAmount": 500000,
+    "brokerage": 250,
+    "taxes": 90,
+    "otherCharges": 50,
+    "totalCost": 500390,
+    "executionTime": "2026-01-06T10:30:00Z",
+    "executionStatus": "FILLED",
+    "confirmationNumber": "CONF-789",
+    "transactionId": "TXN-123",
+
+    // Settlement info if exists
+    "settlement": {
+      "id": 789,
+      "settlementDate": "2026-01-07",
+      "settlementStatus": "SETTLED",
+      "custodianReference": "CUST-REF-456"
+    }
+  }
+}
+```
+
+### 9.3 Settlement APIs
+
+#### Get Settlement Status
+
+```http
+GET /api/v1/investment/settlements/execution/{executionId}
+Authorization: Bearer {token}
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "id": 789,
+    "executionId": 456,
+    "settlementDate": "2026-01-07",
+    "settlementStatus": "SETTLED",
+    "custodianReference": "CUST-REF-456",
+    "clearingHouse": "NSDL",
+    "settledAmount": 500390,
+    "settledQuantity": 100,
+    "settledAt": "2026-01-07T11:00:00Z",
+    "createdAt": "2026-01-06T10:30:00Z"
+  }
+}
+```
+
+#### Trigger Settlement (Manual - for demo)
+
+```http
+POST /api/v1/investment/settlements/execute/{executionId}
+Authorization: Bearer {token}
+
+Response (200 OK):
+{
+  "success": true,
+  "message": "Settlement processed successfully",
+  "data": {
+    "settlementId": 789,
+    "executionId": 456,
+    "settlementStatus": "SETTLED",
+    "settledAt": "2026-01-07T11:00:00Z"
+  }
+}
+```
+
+### 9.4 Holdings APIs
+
+#### Get Customer Holdings
+
+```http
+GET /api/v1/investment/holdings/customer/{customerId}
+Authorization: Bearer {token}
+Query Parameters:
+  - goalId (optional): 50
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "customerId": 456,
+    "customerName": "Sujit Rujuk",
+    "totalInvestedAmount": 3500000,
+    "totalCurrentValue": 3850000,
+    "totalUnrealizedGain": 350000,
+    "totalUnrealizedGainPercentage": 10,
+    "lastUpdated": "2026-01-06T18:00:00Z",
+
+    "holdings": [
+      {
+        "id": 1,
+        "goalId": 50,
+        "goalName": "Retirement Planning",
+        "fundId": 10,
+        "fundName": "HDFC Top 100 Fund",
+        "fundCode": "HDFC_TOP100",
+        "quantity": 100,
+        "averageCost": 5000,
+        "currentNAV": 5500,
+        "currentValue": 550000,
+        "investedAmount": 500000,
+        "unrealizedGain": 50000,
+        "unrealizedGainPercentage": 10,
+        "lastUpdated": "2026-01-06T18:00:00Z"
+      },
+      {
+        "id": 2,
+        "goalId": 50,
+        "goalName": "Retirement Planning",
+        "fundId": 11,
+        "fundName": "ICICI Prudential Bluechip",
+        "fundCode": "ICICI_BLUECHIP",
+        "quantity": 60,
+        "averageCost": 5000,
+        "currentNAV": 5400,
+        "currentValue": 324000,
+        "investedAmount": 300000,
+        "unrealizedGain": 24000,
+        "unrealizedGainPercentage": 8,
+        "lastUpdated": "2026-01-06T18:00:00Z"
+      }
+      // ... more holdings
+    ]
+  }
+}
+```
+
+#### Get Holdings by Goal
+
+```http
+GET /api/v1/investment/holdings/goal/{goalId}
+Authorization: Bearer {token}
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "goalId": 50,
+    "goalName": "Retirement Planning",
+    "totalInvestedAmount": 3500000,
+    "totalCurrentValue": 3850000,
+    "totalUnrealizedGain": 350000,
+    "totalUnrealizedGainPercentage": 10,
+
+    "holdings": [
+      // Same structure as above
+    ]
+  }
+}
+```
+
+### 9.5 Reconciliation APIs
+
+#### Run Reconciliation (Daily batch job trigger)
+
+```http
+POST /api/v1/investment/reconciliation/run
+Authorization: Bearer {token}
+Content-Type: application/json
+
+Request:
+{
+  "reconciliationDate": "2026-01-06",
+  "entityTypes": ["ORDER", "EXECUTION", "POSITION", "CASH"]
+}
+
+Response (200 OK):
+{
+  "success": true,
+  "message": "Reconciliation completed",
+  "data": {
+    "reconciliationDate": "2026-01-06",
+    "totalRecords": 150,
+    "matched": 148,
+    "breaks": 2,
+    "summary": {
+      "ORDER": { "total": 50, "matched": 50, "breaks": 0 },
+      "EXECUTION": { "total": 50, "matched": 50, "breaks": 0 },
+      "POSITION": { "total": 40, "matched": 38, "breaks": 2 },
+      "CASH": { "total": 10, "matched": 10, "breaks": 0 }
+    },
+    "breaks": [
+      {
+        "id": 1,
+        "entityType": "POSITION",
+        "entityId": 1,
+        "internalValue": 100,
+        "custodianValue": 99.5,
+        "variance": 0.5,
+        "status": "BREAK",
+        "breakReason": "Quantity mismatch - likely due to corporate action"
+      },
+      {
+        "id": 2,
+        "entityType": "POSITION",
+        "entityId": 5,
+        "internalValue": 200,
+        "custodianValue": 202,
+        "variance": -2,
+        "status": "BREAK",
+        "breakReason": "Value mismatch - NAV difference"
+      }
+    ],
+    "completedAt": "2026-01-06T20:00:00Z"
+  }
+}
+```
+
+#### Get Reconciliation Report
+
+```http
+GET /api/v1/investment/reconciliation/report
+Authorization: Bearer {token}
+Query Parameters:
+  - fromDate: 2026-01-01
+  - toDate: 2026-01-07
+  - status (optional): MATCHED, BREAK, RESOLVED
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "fromDate": "2026-01-01",
+    "toDate": "2026-01-07",
+    "totalRecords": 1050,
+    "matched": 1045,
+    "breaks": 3,
+    "resolved": 2,
+    "pending": 1,
+
+    "dailySummary": [
+      {
+        "date": "2026-01-06",
+        "total": 150,
+        "matched": 148,
+        "breaks": 2
+      }
+      // ... more days
+    ],
+
+    "unresolvedBreaks": [
+      {
+        "id": 2,
+        "reconciliationDate": "2026-01-06",
+        "entityType": "POSITION",
+        "breakReason": "Value mismatch - NAV difference",
+        "variance": -2,
+        "status": "INVESTIGATING"
+      }
+    ]
+  }
+}
+```
+
+#### Resolve Reconciliation Break
+
+```http
+POST /api/v1/investment/reconciliation/{reconciliationId}/resolve
+Authorization: Bearer {token}
+Content-Type: application/json
+
+Request:
+{
+  "resolutionNotes": "Corporate action - bonus shares issued. Updated internal records to match custodian.",
+  "resolvedBy": 789
+}
+
+Response (200 OK):
+{
+  "success": true,
+  "message": "Reconciliation break resolved",
+  "data": {
+    "id": 1,
+    "status": "RESOLVED",
+    "resolvedBy": 789,
+    "resolvedAt": "2026-01-06T21:00:00Z",
+    "resolutionNotes": "Corporate action - bonus shares issued. Updated internal records to match custodian."
+  }
+}
+```
+
+### 9.6 Dashboard/Summary APIs
+
+#### RM Order Execution Dashboard
+
+```http
+GET /api/v1/investment/dashboard/rm/{rmId}
+Authorization: Bearer {token}
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "rmId": 789,
+    "rmName": "Rajesh Kumar",
+
+    "summary": {
+      "totalOrders": 250,
+      "pendingOrders": 10,
+      "filledToday": 15,
+      "settledToday": 12,
+      "totalValueExecuted": 125000000,  // ₹12.5 Cr
+      "totalValueSettled": 100000000    // ₹10 Cr
+    },
+
+    "recentOrders": [
+      {
+        "id": 1001,
+        "customerName": "Sujit Rujuk",
+        "fundName": "HDFC Top 100 Fund",
+        "targetAmount": 500000,
+        "orderStatus": "FILLED",
+        "orderDate": "2026-01-06T10:00:00Z"
+      }
+      // ... more recent orders
+    ],
+
+    "pendingOrders": [
+      {
+        "id": 1005,
+        "customerName": "Amit Sharma",
+        "fundName": "SBI Bluechip Fund",
+        "targetAmount": 300000,
+        "orderStatus": "VALIDATED",
+        "orderDate": "2026-01-06T14:00:00Z"
+      }
+      // ... more pending orders
+    ],
+
+    "reconciliationAlerts": {
+      "unresolvedBreaks": 2,
+      "lastReconciliation": "2026-01-05"
+    }
+  }
+}
+```
+
+#### Customer Portfolio Summary
+
+```http
+GET /api/v1/investment/dashboard/customer/{customerId}
+Authorization: Bearer {token}
+
+Response (200 OK):
+{
+  "success": true,
+  "data": {
+    "customerId": 456,
+    "customerName": "Sujit Rujuk",
+
+    "portfolioSummary": {
+      "totalInvested": 3500000,
+      "currentValue": 3850000,
+      "totalGain": 350000,
+      "totalGainPercentage": 10,
+      "lastUpdated": "2026-01-06T18:00:00Z"
+    },
+
+    "goalSummary": [
+      {
+        "goalId": 50,
+        "goalName": "Retirement Planning",
+        "goalType": "RETIREMENT",
+        "invested": 3500000,
+        "currentValue": 3850000,
+        "gain": 350000,
+        "gainPercentage": 10,
+        "fundsCount": 5
+      }
+    ],
+
+    "recentTransactions": [
+      {
+        "date": "2026-01-06",
+        "type": "BUY",
+        "fundName": "HDFC Top 100 Fund",
+        "amount": 500000,
+        "status": "SETTLED"
+      }
+      // ... more transactions
+    ]
+  }
+}
+```
 
 ---
 
-## 9. Seed Data Mapping
+## 10. UI/UX Design
 
-### 9.1 Asset Class to Trading Symbol Mapping
+### 10.1 RM Order Execution Dashboard
 
-| Asset Class Code | Asset Class Name | Example Symbols |
-|------------------|------------------|-----------------|
-| EQ_US_LC | US Large Cap Equity | SPY, QQQ, AAPL, MSFT |
-| EQ_US_MC | US Mid Cap Equity | IJH, VO, MDY |
-| EQ_US_SC | US Small Cap Equity | IWM, VB, IJR |
-| EQ_INTL_DM | International Developed | EFA, VEA, IEFA |
-| EQ_INTL_EM | Emerging Markets | VWO, EEM, IEMG |
-| FI_GOVT | Government Bonds | TLT, IEF, GOVT |
-| FI_CORP_IG | Investment Grade Corp | LQD, VCIT, IGIB |
-| FI_CORP_HY | High Yield Bonds | HYG, JNK, USHY |
-| RE_GLOBAL | Global Real Estate | VNQ, VNQI, REET |
-| CMDTY_GOLD | Gold | GLD, IAU, SGOL |
-| CASH | Cash/Money Market | BIL, SHV, SGOV |
+**Route**: `/rm/order-execution/dashboard`
 
-### 9.2 Portfolio Allocation Example
+**Layout**:
 
-**Conservative Portfolio (LOW_RISK):**
 ```
-Total Investment: $10,000
-
-Asset Allocation:
-- Government Bonds (40%): $4,000 → Buy TLT
-- Investment Grade Corp (25%): $2,500 → Buy LQD
-- US Large Cap (15%): $1,500 → Buy SPY
-- Cash (10%): $1,000 → Buy BIL
-- Gold (10%): $1,000 → Buy GLD
+┌─────────────────────────────────────────────────────────────┐
+│  Navbar (Logo | Order Execution | Customers | Goals | ...)  │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐│
+│  │         Order Execution Dashboard                       ││
+│  │         Today: January 6, 2026                          ││
+│  └────────────────────────────────────────────────────────┘│
+│                                                              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │  Total   │  │ Pending  │  │  Filled  │  │ Settled  │  │
+│  │  Orders  │  │  Orders  │  │  Today   │  │  Today   │  │
+│  │   250    │  │    10    │  │    15    │  │    12    │  │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐│
+│  │  Pending Orders Requiring Action                       ││
+│  ├────────────────────────────────────────────────────────┤│
+│  │ Customer       │ Fund           │ Amount    │ Actions  ││
+│  ├────────────────────────────────────────────────────────┤│
+│  │ Sujit Rujuk    │ HDFC Top 100  │ ₹5,00,000 │ [Execute]││
+│  │ Amit Sharma    │ SBI Bluechip  │ ₹3,00,000 │ [Execute]││
+│  │ Priya Kapoor   │ Axis Midcap   │ ₹2,00,000 │ [Execute]││
+│  └────────────────────────────────────────────────────────┘│
+│                                                              │
+│  ┌─────────────────────┐  ┌──────────────────────────────┐│
+│  │ Recent Executions   │  │ Reconciliation Status        ││
+│  ├─────────────────────┤  ├──────────────────────────────┤│
+│  │ 10:30 - Sujit ...  │  │ Last Run: Jan 5, 2026        ││
+│  │ 10:45 - Amit  ...  │  │ Status: 2 Breaks Pending     ││
+│  │ 11:00 - Priya ...  │  │ [View Report] [Run Now]      ││
+│  └─────────────────────┘  └──────────────────────────────┘│
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+### 10.2 Order Execution Flow (RM)
+
+**Step 1: Proposal Accepted → Auto-create Orders**
+
+```
+Customer accepts proposal
+  ↓
+System automatically creates orders
+  ↓
+RM receives notification:
+  "New orders created for Sujit Rujuk - 5 funds, ₹35,00,000"
+  [View Orders]
+```
+
+**Step 2: Review & Validate Orders**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Order Execution - Sujit Rujuk                              │
+│  Proposal ID: 123 | Goal: Retirement Planning               │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐│
+│  │ Order #1001                               [Validated ✓] ││
+│  ├────────────────────────────────────────────────────────┤│
+│  │ Fund: HDFC Top 100 Fund                                ││
+│  │ Target Amount: ₹5,00,000                               ││
+│  │ Estimated Units: 100 @ ₹5,000/unit                     ││
+│  │ Status: VALIDATED                                       ││
+│  │                                                          ││
+│  │ Pre-execution Checks:                                   ││
+│  │  ✓ Funds Available                                     ││
+│  │  ✓ Fund Available for Purchase                         ││
+│  │  ✓ Suitability Compliant                               ││
+│  │  ✓ Within Investment Limits                            ││
+│  │                                                          ││
+│  │ [Execute Order]  [View Details]  [Cancel]              ││
+│  └────────────────────────────────────────────────────────┘│
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐│
+│  │ Order #1002                               [Validated ✓] ││
+│  │ Fund: ICICI Prudential Bluechip                        ││
+│  │ Target Amount: ₹3,00,000                               ││
+│  │ [Execute Order]  [View Details]  [Cancel]              ││
+│  └────────────────────────────────────────────────────────┘│
+│                                                              │
+│  ... (3 more orders)                                        │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐│
+│  │ Total: 5 Orders | ₹35,00,000                           ││
+│  │ [Execute All Orders]  [Cancel All]                     ││
+│  └────────────────────────────────────────────────────────┘│
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Step 3: Order Execution**
+
+```
+RM clicks [Execute Order]
+  ↓
+Loading modal: "Submitting order to custodian..."
+  ↓
+Success modal:
+┌─────────────────────────────────────────────┐
+│  ✓ Order Executed Successfully               │
+│                                              │
+│  Execution ID: EXE-456                      │
+│  Fund: HDFC Top 100 Fund                    │
+│  Executed Quantity: 100 units               │
+│  Executed Price: ₹5,000/unit                │
+│  Total Amount: ₹5,00,390                    │
+│    (includes ₹250 brokerage + ₹90 taxes)   │
+│                                              │
+│  Confirmation: CONF-789                     │
+│  Execution Time: 10:30 AM                   │
+│                                              │
+│  Settlement Date: Jan 7, 2026 (T+1)         │
+│                                              │
+│  [Download Confirmation]  [Close]           │
+└─────────────────────────────────────────────┘
+```
+
+**Step 4: Settlement Tracking**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Order #1001 - Settlement Status                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │  Timeline                                            │  │
+│  │  ●───●───●───○                                       │  │
+│  │  Order Execution Settlement Confirmed                │  │
+│  │  Created      (T+1)                                  │  │
+│  │  10:00 AM 10:30 AM  [Pending]                        │  │
+│  └─────────────────────────────────────────────────────┘  │
+│                                                              │
+│  Execution Details:                                         │
+│  • Executed: 100 units @ ₹5,000/unit                       │
+│  • Total: ₹5,00,390                                        │
+│  • Confirmation: CONF-789                                  │
+│                                                              │
+│  Settlement Details:                                        │
+│  • Expected Date: Jan 7, 2026                              │
+│  • Status: Pending                                         │
+│  • Custodian Ref: (Will be updated on T+1)                │
+│                                                              │
+│  [Refresh Status]  [Download Report]                       │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 10.3 Customer Portfolio View
+
+**Route**: `/client/portfolio`
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  My Portfolio                                               │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Total Invested       Current Value      Total Gain   │  │
+│  │  ₹35,00,000          ₹38,50,000         ₹3,50,000    │  │
+│  │                                          +10%         │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐│
+│  │  Retirement Planning                                    ││
+│  │  Invested: ₹35,00,000 | Current: ₹38,50,000 | +10%    ││
+│  ├────────────────────────────────────────────────────────┤│
+│  │                                                          ││
+│  │  Fund Holdings:                                         ││
+│  │  ┌────────────────────────────────────────────────┐   ││
+│  │  │ HDFC Top 100 Fund                              │   ││
+│  │  │ 100 units @ ₹5,000 avg                         │   ││
+│  │  │ Current NAV: ₹5,500                            │   ││
+│  │  │ Value: ₹5,50,000 | Gain: +₹50,000 (+10%)      │   ││
+│  │  └────────────────────────────────────────────────┘   ││
+│  │                                                          ││
+│  │  ┌────────────────────────────────────────────────┐   ││
+│  │  │ ICICI Prudential Bluechip                      │   ││
+│  │  │ 60 units @ ₹5,000 avg                          │   ││
+│  │  │ Current NAV: ₹5,400                            │   ││
+│  │  │ Value: ₹3,24,000 | Gain: +₹24,000 (+8%)       │   ││
+│  │  └────────────────────────────────────────────────┘   ││
+│  │                                                          ││
+│  │  ... (3 more funds)                                    ││
+│  │                                                          ││
+│  └────────────────────────────────────────────────────────┘│
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐│
+│  │  Recent Transactions                                    ││
+│  ├────────────────────────────────────────────────────────┤│
+│  │ Date        │ Type │ Fund           │ Amount    │Status││
+│  ├────────────────────────────────────────────────────────┤│
+│  │ Jan 6, 2026 │ BUY  │ HDFC Top 100  │ ₹5,00,000 │Settled││
+│  │ Jan 6, 2026 │ BUY  │ ICICI Bluechip│ ₹3,00,000 │Settled││
+│  │ ...                                                     ││
+│  └────────────────────────────────────────────────────────┘│
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 10.4 Reconciliation Dashboard (RM/Admin)
+
+**Route**: `/rm/reconciliation`
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Reconciliation Dashboard                                   │
+│  Last Run: January 5, 2026, 8:00 PM                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │  Total   │  │ Matched  │  │  Breaks  │  │ Resolved │  │
+│  │  Records │  │          │  │          │  │          │  │
+│  │   150    │  │   148    │  │     2    │  │     0    │  │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐│
+│  │  Reconciliation Breaks Requiring Action                ││
+│  ├────────────────────────────────────────────────────────┤│
+│  │ ID │ Type     │ Entity      │ Variance │ Reason       ││
+│  ├────────────────────────────────────────────────────────┤│
+│  │ 1  │ POSITION │ Holding #1  │ +0.5     │ Qty mismatch ││
+│  │    │          │ HDFC Top100 │          │ [Investigate]││
+│  ├────────────────────────────────────────────────────────┤│
+│  │ 2  │ POSITION │ Holding #5  │ -2.0     │ Value diff   ││
+│  │    │          │ SBI Equity  │          │ [Investigate]││
+│  └────────────────────────────────────────────────────────┘│
+│                                                              │
+│  ┌─────────────────────┐  ┌──────────────────────────────┐│
+│  │ Reconciliation      │  │ Actions                      ││
+│  │ History (7 days)    │  │                              ││
+│  ├─────────────────────┤  │ [Run Reconciliation Now]     ││
+│  │ Jan 5: 148/150 ✓    │  │ [Download Report]            ││
+│  │ Jan 4: 140/142 ✓    │  │ [View Audit Trail]           ││
+│  │ Jan 3: 135/135 ✓✓   │  │ [Export to Excel]            ││
+│  │ ...                 │  │                              ││
+│  └─────────────────────┘  └──────────────────────────────┘│
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 10.5 Components to Build
+
+**Frontend (Angular 19)**:
+
+1. **OrderExecutionDashboardComponent** - Main dashboard
+2. **OrderListComponent** - List of orders with filters
+3. **OrderExecutionComponent** - Execute single/multiple orders
+4. **OrderDetailsComponent** - View order execution details
+5. **SettlementTrackingComponent** - Track settlement status
+6. **HoldingsComponent** - Display customer holdings
+7. **ReconciliationDashboardComponent** - Reconciliation overview
+8. **ReconciliationBreakComponent** - Investigate/resolve breaks
+9. **TransactionHistoryComponent** - Order/execution history
+
+**Backend (Spring Boot)**:
+
+1. **InvestmentOrderController** - Order CRUD APIs
+2. **OrderExecutionController** - Execution APIs
+3. **SettlementController** - Settlement tracking APIs
+4. **HoldingController** - Holdings APIs
+5. **ReconciliationController** - Reconciliation APIs
+6. **MockCustodianService** - Simulate custodian responses
+7. **ReconciliationService** - Reconciliation logic
+8. **OrderValidationService** - Pre-execution validation
 
 ---
 
-## 10. API Endpoints Design
+## 11. Sources
 
-### 10.1 Investment Execution Endpoints
+### Custodian Services
 
-```
-POST   /api/v1/investment/execute
-       Body: { proposalId, investmentAmount }
-       Response: { executionId, status, orders[] }
+- [Straits Financial - Understanding Custody Fund Services](https://www.straitsfinancial.com/insights/understanding-custody-fund-services)
+- [PL Capital - What is Mutual Fund Custodian](https://www.plindia.com/blogs/what-is-mutual-fund-custodian/)
+- [Seccl Tech - Custody & Investment Infrastructure](https://seccl.tech/services/custody-investment-infrastructure/)
+- [Paystand - What is a Custodian in Finance](https://www.paystand.com/blog/what-is-a-custodian-in-finance)
+- [SuperMoney - Mutual Fund Custodians](https://www.supermoney.com/encyclopedia/fund-custodian)
+- [Callan - Role of Custodians in Institutional Investing](https://www.callan.com/blog/custodian-primer/)
 
-GET    /api/v1/investment/execution/{id}
-       Response: { execution, orders[], positions[] }
+### Reconciliation & Order Management
 
-GET    /api/v1/investment/execution/{id}/orders
-       Response: { orders[] }
-
-POST   /api/v1/investment/execution/{id}/reconcile
-       Response: { reconciliationResult }
-
-GET    /api/v1/investment/customer/{customerId}/positions
-       Response: { positions[] }
-
-GET    /api/v1/investment/customer/{customerId}/transactions
-       Response: { transactions[] }
-```
-
----
-
-## 11. Configuration
-
-### 11.1 Application Properties
-
-```yaml
-# Broker Configuration
-broker:
-  provider: mock  # Options: mock, alpaca, drivewealth
-
-# Alpaca Configuration (when provider=alpaca)
-alpaca:
-  api-key: ${ALPACA_API_KEY}
-  secret-key: ${ALPACA_SECRET_KEY}
-  base-url: https://paper-api.alpaca.markets
-  data-url: https://data.alpaca.markets
-
-# Mock Broker Configuration (for demo)
-mock-broker:
-  execution-delay-ms: 500
-  fill-probability: 0.95
-  use-random-prices: false
-```
-
----
-
-## 12. Sources & References
-
-### Trading API Providers (Global)
-- [Alpaca Markets](https://alpaca.markets/) - Commission-free trading API
-- [Alpaca Paper Trading Docs](https://docs.alpaca.markets/docs/paper-trading)
-- [DriveWealth Developer Portal](https://developer.drivewealth.com/)
-- [Interactive Brokers TWS API](https://interactivebrokers.github.io/tws-api/)
-- [WealthKernel Investing API](https://www.wealthkernel.com/platform/investing-api)
-- [Upvest Investment API](https://upvest.co/)
-
-### India Trading APIs
-- [Fintech Primitives API Docs](https://fintechprimitives.com/docs/api/)
-- [Kite Connect (Zerodha) Mutual Funds API](https://kite.trade/docs/connect/v3/mutual-funds/)
-- [Groww Trade API](https://groww.in/trade-api)
-- [DhanHQ Trading APIs](https://dhanhq.co/)
-- [5paisa Developer APIs](https://www.5paisa.com/technology/developer-apis)
-- [ICICI Breeze API](https://www.icicidirect.com/futures-and-options/api/breeze)
-- [BSE StAR MF GitHub Library](https://github.com/utkarshohm/mf-platform-bse)
-- [MFapi.in - Free India MF API](https://www.mfapi.in/)
-
-### Reconciliation & Settlement
+- [Gartner - Financial Reconciliation Solutions](https://www.gartner.com/reviews/market/financial-reconciliation-solutions)
 - [Limina - Investment Reconciliation Guide](https://www.limina.com/blog/investment-reconciliation)
-- [Limina - Cash Position Reconciliation Guide](https://www.limina.com/blog/cash-position-reconciliation-guide)
+- [Limina - NAV and P&L Reconciliation](https://www.limina.com/blog/pnl-and-nav-reconciliation-guide)
+- [SolveXia - Finance Reconciliation Best Practices](https://www.solvexia.com/blog/finance-reconciliation-how-to-step-by-step-process)
+- [SolveXia - 12 Best Reconciliation Tools 2026](https://www.solvexia.com/blog/5-best-reconciliation-tools-complete-guide)
+- [FRS - Reconciliations for Wealth Management](https://frsltd.com/wealth-management/reconciliations/)
+- [AutoRek - Reconciliation Platform](https://www.autorek.com/)
+- [Trintech - Financial Close Software](https://www.trintech.com/)
+
+### Order Management Systems
+
+- [United Fintech - Order Management Systems](https://unitedfintech.com/order-management-systems/)
+- [IMTC - OMS for Fixed Income](https://imtc.com/products/order-management/)
+- [INDATA - Trade Order Management](https://www.indataipm.com/trade-order-management/)
+- [INDATA - OMS vs EMS](https://www.indataipm.com/order-management-system-vs-execution-management-system-whats-the-difference/)
 - [SS&C Eze - What is an OMS](https://www.ezesoft.com/insights/blog/what-is-an-order-management-system)
-- [Investment Banking Reconciliation Explained](https://mentormecareers.com/reconciliation-in-investment-banking/)
-- [Trade Life Cycle in Investment Banking](https://www.investmentbankingcouncil.org/blog/trade-life-cycle-in-investment-banking-and-its-stages)
+- [Limina - Trade Order Management System](https://www.limina.com/solutions/trade-order-management-system)
+- [Charles River Development - Order and Execution Management](https://www.crd.com/solutions/charles-river-trader)
 
-### Paper Trading Platforms
-- [Paper Invest API](https://paperinvest.io/paper-trading-api/)
-- [QuantConnect Paper Trading](https://www.quantconnect.com/docs/v2/cloud-platform/live-trading/brokerages/quantconnect-paper-trading)
-- [TradeStation SIM vs LIVE](https://api.tradestation.com/docs/fundamentals/sim-vs-live/)
+### Trading APIs & Sandboxes
 
-### Wealth Management Platforms
-- [BridgeFT WealthTech API](https://www.bridgeft.com/wealthtech-api/)
-- [FinFolio API](https://www.finfolio.com/api)
-- [Empaxis Integration Best Practices](https://www.empaxis.com/blog/asset-management-integration)
+- [Alpaca Markets](https://alpaca.markets/) - **Recommended for demo**
+- [Financial Modeling Prep (FMP)](https://site.financialmodelingprep.com/developer/docs)
+- [Twelve Data - Mutual Funds APIs](https://twelvedata.com/news/introducing-mutual-funds-apis)
+- [Alpha Vantage](https://www.alphavantage.co/)
+- [MockBank](https://www.mockbank.io/)
+- [GitHub - mock-trading-api](https://github.com/dmitriz/mock-trading-api)
+- [GitHub - Mock-Stocks](https://github.com/JackyTea/Mock-Stocks)
+- [Mockoon - Financial API Samples](https://mockoon.com/mock-samples/category/financial/)
 
----
+### Wealth Management APIs
 
-## 13. Recommended Implementation Path
+- [WealthOS API](https://wos-gb.sandbox.wealthos.cloud/admin/documentation)
+- [OpenWealth Association](https://openwealth.ch/)
+- [Synpulse8 - OpenWealth Sandbox](https://synpulse8.com/our-solutions/openwealth-sandbox)
+- [Goldman Sachs Developer](https://developer.gs.com/docs/)
+- [FasterCapital - Wealth Management APIs](https://www.fastercapital.com/content/Wealth-Management-APIs--The-Power-of-Connectivity--Leveraging-APIs-for-Enhanced-Wealth-Management.html)
+- [InvestSuite - APIs in WealthTech](https://www.investsuite.com/insights/blogs/the-future-is-now-how-apis-are-revolutionizing-wealthtech-infrastructure)
+- [Velexa - Investment API](https://velexa.com/investment-api/)
 
-### For Demo (Today):
+### Trade Lifecycle
 
-1. **Create Database Tables** (30 min)
-   - investment_execution
-   - investment_order
-   - position_snapshot
-
-2. **Implement MockBrokerService** (1 hour)
-   - Simulate order placement
-   - Return realistic responses
-   - Use seeded price data
-
-3. **Implement InvestmentExecutionService** (1.5 hours)
-   - initiateInvestment()
-   - calculateOrdersFromPortfolio()
-   - executeOrders()
-
-4. **Create REST Controllers** (45 min)
-   - POST /execute
-   - GET /execution/{id}
-   - GET /positions
-
-5. **Frontend Integration** (1 hour)
-   - Investment confirmation page
-   - Order status display
-   - Position summary
-
-### Total Estimated Time: 4-5 hours
+- [The Wealth Mosaic - Trade Processing Systems](https://www.thewealthmosaic.com/vendors/corfinancial/blogs/enhancing-operational-efficiency-the-role-of-trade/)
+- [Intuition - Trade Life Cycle 5 Key Stages](https://www.intuition.com/the-lifecycle-of-a-trade-5-key-stages/)
+- [IBCA - Trade Life Cycle in Investment Banking](https://www.investmentbankingcouncil.org/blog/trade-life-cycle-in-investment-banking-and-its-stages)
+- [ProSchoolOnline - What is Trade Life Cycle](https://proschoolonline.com/blog/what-is-trade-life-cycle)
+- [Loffa Interactive - Trade Lifecycle in T+1 Era](https://loffacorp.com/from-execution-to-settlement-demystifying-the-trade-lifecycle-in-t1-era/)
+- [Limina - Guide to Post Trade Management](https://www.limina.com/blog/guide-post-trade-management-software)
 
 ---
 
-## 14. Conclusion
+## Next Steps
 
-For the demo, implementing a **Mock Broker Service** with realistic order simulation provides the fastest path to a working demonstration. The architecture is designed with a **Strategy Pattern** allowing seamless switching to Alpaca's paper trading or any production custodian when the client is ready.
-
-The key is to:
-1. Build the right database schema now
-2. Use interfaces for broker integration
-3. Start with mock, upgrade to real APIs later
-4. Maintain proper order lifecycle tracking
-5. Store all transaction records for audit
-
-This approach demonstrates the full investment flow to clients while keeping the architecture production-ready for their custodian integration.
+1. ✅ **Research Complete** - Document saved
+2. ⏳ **Design Approval** - Review architecture with team
+3. ⏳ **Backend Implementation**:
+   - Create database schema
+   - Implement entities & repositories
+   - Build REST APIs
+   - Create Mock Custodian Service
+4. ⏳ **Frontend Implementation**:
+   - Build Angular components
+   - Integrate with backend APIs
+   - Add real-time updates
+5. ⏳ **Testing**:
+   - End-to-end flow testing
+6. ⏳ **Demo Preparation**:
+   - Seed data
+   - Mock scenarios
+   - User guides
 
 ---
 
-**Document Status:** Updated January 2026
-**Next Steps:** Implementation of Mock Broker Service and Database Schema
+**Document Version**: 1.0
+**Last Updated**: January 6, 2026
+**Author**: Claude (AI Research Assistant)
+**Status**: Ready for Implementation
