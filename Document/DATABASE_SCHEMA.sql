@@ -30,34 +30,70 @@ CREATE TABLE roles (
 COMMENT ON TABLE roles IS 'System role definitions for RBAC';
 COMMENT ON COLUMN roles.role_code IS 'Unique role identifier (SUPER_ADMIN, RM, CUSTOMER)';
 
--- Users table (all system users)
+-- Users table (ALL system users - common fields for Super Admin, RM, Customer)
+-- Personal info is stored here, role-specific data goes in respective tables
 CREATE TABLE users (
     id BIGSERIAL PRIMARY KEY,
     email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
+    password_hash VARCHAR(255),
     role_id BIGINT NOT NULL REFERENCES roles(id),
+
+    -- Personal Information (common for all roles)
     first_name VARCHAR(100) NOT NULL,
     last_name VARCHAR(100) NOT NULL,
     phone_number VARCHAR(20),
-    is_active BOOLEAN DEFAULT TRUE,
+    date_of_birth DATE,
+    gender VARCHAR(20),
+    marital_status VARCHAR(20),
+
+    -- Address Information (common for all roles)
+    address_line1 VARCHAR(255),
+    address_line2 VARCHAR(255),
+    city VARCHAR(100),
+    state VARCHAR(100),
+    country VARCHAR(100) DEFAULT 'India',
+    pincode VARCHAR(20),
+
+    -- Account Status
+    status VARCHAR(20) DEFAULT 'PENDING',
+    is_active BOOLEAN DEFAULT FALSE,
     is_email_verified BOOLEAN DEFAULT FALSE,
-    email_verification_token VARCHAR(255),
+
+    -- Invite Flow Fields
+    invite_token VARCHAR(255),
+    invite_token_expires_at TIMESTAMP,
+    invited_at TIMESTAMP,
+    invited_by BIGINT REFERENCES users(id),
+
+    -- Password Reset Fields
     password_reset_token VARCHAR(255),
     password_reset_expires_at TIMESTAMP,
+
+    -- Tracking
     last_login_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    created_by VARCHAR(100),
-    updated_by VARCHAR(100)
+    created_by BIGINT REFERENCES users(id),
+    updated_by BIGINT REFERENCES users(id),
+
+    -- Constraints
+    CONSTRAINT chk_user_status CHECK (status IN ('PENDING', 'ACTIVE', 'INACTIVE')),
+    CONSTRAINT chk_user_gender CHECK (gender IS NULL OR gender IN ('MALE', 'FEMALE', 'OTHER', 'PREFER_NOT_TO_SAY')),
+    CONSTRAINT chk_user_marital_status CHECK (marital_status IS NULL OR marital_status IN ('SINGLE', 'MARRIED', 'DIVORCED', 'WIDOWED', 'SEPARATED'))
 );
 
-COMMENT ON TABLE users IS 'All system users (Super Admin, RM, Customer)';
-COMMENT ON COLUMN users.password_hash IS 'BCrypt hashed password';
-COMMENT ON COLUMN users.role_id IS 'Foreign key to roles table';
+COMMENT ON TABLE users IS 'All system users - common personal info for Super Admin, RM, and Customer';
+COMMENT ON COLUMN users.password_hash IS 'BCrypt hashed password - NULL until user sets password via invite';
+COMMENT ON COLUMN users.role_id IS 'Foreign key to roles table (SUPER_ADMIN, RM, CUSTOMER)';
+COMMENT ON COLUMN users.status IS 'User status: PENDING (invited), ACTIVE (password set), INACTIVE (deactivated)';
+COMMENT ON COLUMN users.invite_token IS 'JWT token for invite/password setup';
+COMMENT ON COLUMN users.invited_by IS 'User ID who sent the invite';
 
 CREATE INDEX idx_users_email ON users(email);
 CREATE INDEX idx_users_role_id ON users(role_id);
 CREATE INDEX idx_users_active ON users(is_active);
+CREATE INDEX idx_users_status ON users(status);
+CREATE INDEX idx_users_invite_token ON users(invite_token);
 
 -- Relationship Managers table (RM-specific profile data)
 CREATE TABLE relationship_managers (
@@ -82,26 +118,41 @@ CREATE INDEX idx_rm_user_id ON relationship_managers(user_id);
 CREATE INDEX idx_rm_employee_id ON relationship_managers(employee_id);
 CREATE INDEX idx_rm_active ON relationship_managers(is_active);
 
--- Customers table (Customer-specific profile data)
+-- Customers table (Customer-specific profile data ONLY)
+-- Personal info (name, email, phone, address, etc.) is in users table
+-- This table only stores customer-specific attributes
 CREATE TABLE customers (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     customer_code VARCHAR(50) UNIQUE NOT NULL,
-    rm_id BIGINT REFERENCES relationship_managers(id),
-    aadhaar_number_encrypted VARCHAR(255),
-    date_of_birth DATE NOT NULL,
-    gender VARCHAR(20),
-    marital_status VARCHAR(20),
-    kyc_status VARCHAR(20) DEFAULT 'PENDING',
-    kyc_completed_at TIMESTAMP,
+    rm_id BIGINT NOT NULL REFERENCES relationship_managers(id),
+
+    -- Customer-specific fields (not in users table)
+    number_of_dependents INT DEFAULT 0,
+    occupation VARCHAR(100),
+    employment_type VARCHAR(30),
+
+    -- Status
     is_active BOOLEAN DEFAULT TRUE,
+
+    -- Audit (created_by is auto-set by backend from RM's user_id)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    -- Constraints
+    CONSTRAINT chk_employment_type CHECK (
+        employment_type IS NULL OR
+        employment_type IN ('SALARIED', 'SELF_EMPLOYED', 'BUSINESS', 'RETIRED', 'STUDENT', 'HOMEMAKER', 'UNEMPLOYED')
+    ),
+    CONSTRAINT chk_dependents CHECK (number_of_dependents >= 0)
 );
 
-COMMENT ON TABLE customers IS 'Customer-specific profile data';
-COMMENT ON COLUMN customers.rm_id IS 'Assigned Relationship Manager';
-COMMENT ON COLUMN customers.kyc_status IS 'KYC status: PENDING, IN_PROGRESS, COMPLETED, REJECTED';
+COMMENT ON TABLE customers IS 'Customer-specific profile data - personal info is in users table';
+COMMENT ON COLUMN customers.user_id IS 'FK to users table - contains all personal info (name, email, address, etc.)';
+COMMENT ON COLUMN customers.rm_id IS 'Assigned Relationship Manager (required - who created/manages this customer)';
+COMMENT ON COLUMN customers.number_of_dependents IS 'Number of financial dependents';
+COMMENT ON COLUMN customers.occupation IS 'Customer occupation/job title';
+COMMENT ON COLUMN customers.employment_type IS 'Employment status: SALARIED, SELF_EMPLOYED, BUSINESS, etc.';
 
 CREATE INDEX idx_customers_user_id ON customers(user_id);
 CREATE INDEX idx_customers_rm_id ON customers(rm_id);
@@ -228,14 +279,21 @@ CREATE TABLE risk_score_categories (
     min_score INT NOT NULL,
     max_score INT NOT NULL,
     description TEXT,
-    recommended_allocation TEXT,
+    risk_level VARCHAR(20) NOT NULL,
+    time_horizon_years INT,
+    color_code VARCHAR(7),
+    icon_name VARCHAR(50),
     display_order INT NOT NULL,
     is_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT chk_score_range CHECK (min_score <= max_score),
-    CONSTRAINT chk_scores_positive CHECK (min_score >= 0)
+    CONSTRAINT chk_scores_positive CHECK (min_score >= 0),
+    CONSTRAINT chk_risk_level CHECK (
+        risk_level IN ('VERY_LOW', 'LOW', 'MODERATE', 'MODERATE_HIGH', 'HIGH', 'VERY_HIGH')
+    ),
+    CONSTRAINT chk_color_code CHECK (color_code IS NULL OR color_code ~ '^#[0-9A-Fa-f]{6}$')
 );
 
 COMMENT ON TABLE risk_score_categories IS 'Risk category definitions (Secure, Conservative, Income, Balance, Aggressive, Speculative)';
@@ -1077,13 +1135,13 @@ INSERT INTO questionnaire_types (type_code, type_name, description) VALUES
 ('SUITABILITY', 'Suitability Assessment', 'MiFID II / FINRA compliant comprehensive suitability evaluation');
 
 -- Insert risk score categories (8-35 scale)
-INSERT INTO risk_score_categories (category_code, category_name, min_score, max_score, description, recommended_allocation, display_order) VALUES
-('SECURE', 'Secure', 8, 13, 'Very conservative investors seeking capital preservation', '10% Equity / 90% Debt', 1),
-('CONSERVATIVE', 'Conservative', 14, 16, 'Conservative investors with low risk tolerance', '20% Equity / 80% Debt', 2),
-('INCOME', 'Income', 17, 21, 'Income-focused investors with moderate-low risk', '40% Equity / 60% Debt', 3),
-('BALANCE', 'Balance', 22, 26, 'Balanced investors seeking growth with moderate risk', '60% Equity / 40% Debt', 4),
-('AGGRESSIVE', 'Aggressive', 27, 31, 'Aggressive investors comfortable with high volatility', '80% Equity / 20% Debt', 5),
-('SPECULATIVE', 'Speculative', 32, 35, 'Highly aggressive investors seeking maximum returns', '95% Equity / 5% Debt', 6);
+INSERT INTO risk_score_categories (category_code, category_name, min_score, max_score, description, risk_level, time_horizon_years, color_code, icon_name, display_order) VALUES
+('SECURE', 'Secure', 8, 13, 'Very conservative investors seeking capital preservation', 'VERY_LOW', 1, '#22C55E', 'shield', 1),
+('CONSERVATIVE', 'Conservative', 14, 16, 'Conservative investors with low risk tolerance', 'LOW', 3, '#84CC16', 'shield-check', 2),
+('INCOME', 'Income', 17, 21, 'Income-focused investors with moderate-low risk', 'MODERATE', 5, '#EAB308', 'trending-up', 3),
+('BALANCE', 'Balance', 22, 26, 'Balanced investors seeking growth with moderate risk', 'MODERATE_HIGH', 7, '#F97316', 'scale', 4),
+('AGGRESSIVE', 'Aggressive', 27, 31, 'Aggressive investors comfortable with high volatility', 'HIGH', 10, '#EF4444', 'flame', 5),
+('SPECULATIVE', 'Speculative', 32, 35, 'Highly aggressive investors seeking maximum returns', 'VERY_HIGH', 15, '#DC2626', 'rocket', 6);
 
 -- Insert goal types (aligned with Backend GoalType enum)
 INSERT INTO goal_types (type_code, type_name, description, icon, display_order) VALUES
